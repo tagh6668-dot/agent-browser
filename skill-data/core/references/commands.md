@@ -103,6 +103,8 @@ agent-browser screenshot --full   # Full page
 agent-browser pdf output.pdf      # Save as PDF
 ```
 
+Headless Chromium screenshots hide native scrollbars for consistent image output.
+
 ## Video Recording
 
 ```bash

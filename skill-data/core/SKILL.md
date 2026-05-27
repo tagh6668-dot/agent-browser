@@ -243,6 +243,8 @@ agent-browser screenshot --full full.png        # full scroll height
 agent-browser screenshot --annotate map.png     # numbered labels + legend keyed to snapshot refs
 ```
 
+Headless Chromium screenshots hide native scrollbars for consistent image output.
+
 `--annotate` is designed for multimodal models: each label `[N]` maps to ref `@eN`.
 
 ### Handle multiple pages via tabs

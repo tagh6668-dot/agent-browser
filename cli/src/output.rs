@@ -1583,6 +1583,7 @@ Usage: agent-browser screenshot [selector] [path]
 
 Captures a screenshot of the current page. If no path is provided,
 saves to a temporary directory with a generated filename.
+Headless Chromium screenshots hide native scrollbars for consistent image output.
 
 Options:
   --full, -f           Capture full page (not just viewport)

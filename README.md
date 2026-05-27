@@ -90,6 +90,8 @@ agent-browser screenshot page.png
 agent-browser close
 ```
 
+Headless Chromium screenshots hide native scrollbars for consistent image output.
+
 ### Traditional Selectors (also supported)
 
 ```bash
