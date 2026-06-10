@@ -128,24 +128,66 @@ pub async fn run_daemon(session: &str) {
     )
     .await;
 
-    #[cfg(unix)]
-    {
-        let _ = fs::remove_file(&socket_path);
+    // Only clean up the sidecar files if this process is still the
+    // registered daemon for the session. After a `close` (sidecars already
+    // unlinked) or a stale-daemon kill, a successor daemon may have written
+    // fresh files at these paths during our shutdown grace window; deleting
+    // them here would make the successor unreachable and strand its browser.
+    let still_registered = fs::read_to_string(&pid_path)
+        .map(|s| s.trim() == process::id().to_string())
+        .unwrap_or(false);
+    if still_registered {
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&socket_path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+        }
+        let _ = fs::remove_file(&pid_path);
+        let _ = fs::remove_file(&version_path);
+        let _ = fs::remove_file(&stream_path);
+        let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
+        let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
+        let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
     }
-    #[cfg(windows)]
-    {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
-    }
-    let _ = fs::remove_file(&pid_path);
-    let _ = fs::remove_file(&version_path);
-    let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
 
     if let Err(e) = result {
         let _ = writeln!(std::io::stderr(), "Daemon error: {}", e);
         process::exit(1);
+    }
+}
+
+/// Sidecar files that make this daemon discoverable by CLI invocations.
+/// `handle_connection` unlinks them the moment a `close` command has been
+/// answered: ensure_daemon's liveness check is socket connectivity, so a
+/// fast follow-up command would otherwise connect to the dying daemon, get
+/// its browser launched there, and lose it when the daemon exits.
+struct DaemonSidecars {
+    closing: std::sync::atomic::AtomicBool,
+    files: Vec<PathBuf>,
+}
+
+impl DaemonSidecars {
+    fn new(files: Vec<PathBuf>) -> Self {
+        Self {
+            closing: std::sync::atomic::AtomicBool::new(false),
+            files,
+        }
+    }
+
+    /// Make this daemon invisible to new CLI invocations.
+    fn begin_close(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for f in &self.files {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -161,6 +203,16 @@ async fn run_socket_server(
 
     let listener =
         UnixListener::bind(socket_path).map_err(|e| format!("Failed to bind socket: {}", e))?;
+
+    let socket_dir = socket_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let sidecars = Arc::new(DaemonSidecars::new(vec![
+        socket_path.clone(),
+        socket_dir.join(format!("{}.pid", session)),
+        socket_dir.join(format!("{}.version", session)),
+    ]));
 
     let stream_file: Option<PathBuf> = if stream_server.is_some() {
         let dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
@@ -192,12 +244,20 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        // A connection racing the post-`close` shutdown gets
+                        // dropped: the client treats the EOF as daemon-
+                        // unreachable and respawns a fresh daemon.
+                        if sidecars.is_closing() {
+                            drop(stream);
+                            continue;
+                        }
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let sc = sidecars.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, reset_tx, sf, cn, sc).await;
                         });
                     }
                     Err(e) => {
@@ -282,6 +342,12 @@ async fn run_socket_server(
     let port_path = socket_dir.join(format!("{}.port", session));
     let _ = fs::write(&port_path, actual_port.to_string());
 
+    let sidecars = Arc::new(DaemonSidecars::new(vec![
+        port_path.clone(),
+        socket_dir.join(format!("{}.pid", session)),
+        socket_dir.join(format!("{}.version", session)),
+    ]));
+
     let stream_file: Option<PathBuf> = if stream_server.is_some() {
         Some(socket_dir.join(format!("{}.stream", session)))
     } else {
@@ -305,12 +371,20 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        // A connection racing the post-`close` shutdown gets
+                        // dropped: the client treats the EOF as daemon-
+                        // unreachable and respawns a fresh daemon.
+                        if sidecars.is_closing() {
+                            drop(stream);
+                            continue;
+                        }
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let sc = sidecars.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, reset_tx, sf, cn, sc).await;
                         });
                     }
                     Err(e) => {
@@ -360,6 +434,7 @@ async fn handle_connection<S>(
     idle_reset_tx: Option<Arc<mpsc::Sender<()>>>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
+    sidecars: Arc<DaemonSidecars>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -416,6 +491,12 @@ async fn handle_connection<S>(
                     if let Some(ref path) = stream_file_cleanup {
                         let _ = fs::remove_file(path);
                     }
+                    // Unlink the socket/pid/version sidecars BEFORE the grace
+                    // sleep. ensure_daemon probes the socket path, so a fast
+                    // follow-up command would otherwise reach this dying
+                    // daemon, auto-launch its browser here, and lose it when
+                    // the daemon exits below.
+                    sidecars.begin_close();
                     // Signal the daemon loop to exit gracefully instead of
                     // calling process::exit(), which skips destructors and
                     // can leave Chrome processes orphaned (issue #1113).
@@ -675,5 +756,35 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_sidecars_begin_close_unlinks_files_and_flips_flag() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-browser-sidecars-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let pid = dir.join("s.pid");
+        fs::write(&sock, "").unwrap();
+        fs::write(&pid, "123").unwrap();
+
+        let sidecars = DaemonSidecars::new(vec![sock.clone(), pid.clone()]);
+        assert!(!sidecars.is_closing());
+
+        sidecars.begin_close();
+
+        // The dying daemon must be invisible to ensure_daemon immediately:
+        // no socket to probe, no pid/version files for a successor to lose.
+        assert!(sidecars.is_closing());
+        assert!(!sock.exists());
+        assert!(!pid.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
