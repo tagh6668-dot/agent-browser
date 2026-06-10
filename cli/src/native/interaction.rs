@@ -6,6 +6,9 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 
+/// Returns true if a JavaScript dialog opened while the click was being
+/// dispatched (the click sequence stops there; the page is blocked until the
+/// dialog is resolved with `dialog accept` / `dialog dismiss`).
 pub async fn click(
     client: &CdpClient,
     session_id: &str,
@@ -14,7 +17,7 @@ pub async fn click(
     button: &str,
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -32,7 +35,7 @@ pub async fn dblclick(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     click(
         client,
         session_id,
@@ -884,6 +887,46 @@ pub async fn tap_touch(
     Ok(())
 }
 
+/// Dispatches one mouse event and waits for the browser to ack it, but
+/// returns Ok(true) if a JavaScript dialog opens first. A synchronous dialog
+/// (confirm/prompt/alert in the event handler) blocks the renderer's main
+/// thread, so the input ack cannot arrive until the dialog is resolved;
+/// without this the command hangs until the client read timeout and the agent
+/// never sees the pending-dialog warning.
+async fn dispatch_mouse_or_dialog(
+    client: &CdpClient,
+    session_id: &str,
+    params: &DispatchMouseEventParams,
+) -> Result<bool, String> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Subscribe before sending so the dialog event cannot slip past us.
+    let mut events = client.subscribe();
+    let send =
+        client.send_command_typed::<_, Value>("Input.dispatchMouseEvent", params, Some(session_id));
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            res = &mut send => {
+                res?;
+                return Ok(false);
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(e) if e.method == "Page.javascriptDialogOpening" => return Ok(true),
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => {
+                        (&mut send).await?;
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Returns true if a JavaScript dialog opened mid-click (sequence aborted).
 async fn dispatch_click(
     client: &CdpClient,
     session_id: &str,
@@ -891,25 +934,27 @@ async fn dispatch_click(
     y: f64,
     button: &str,
     click_count: i32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Move
-    client
-        .send_command_typed::<_, Value>(
-            "Input.dispatchMouseEvent",
-            &DispatchMouseEventParams {
-                event_type: "mouseMoved".to_string(),
-                x,
-                y,
-                button: None,
-                buttons: None,
-                click_count: None,
-                delta_x: None,
-                delta_y: None,
-                modifiers: None,
-            },
-            Some(session_id),
-        )
-        .await?;
+    if dispatch_mouse_or_dialog(
+        client,
+        session_id,
+        &DispatchMouseEventParams {
+            event_type: "mouseMoved".to_string(),
+            x,
+            y,
+            button: None,
+            buttons: None,
+            click_count: None,
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        },
+    )
+    .await?
+    {
+        return Ok(true);
+    }
 
     let button_value = match button {
         "right" => 2,
@@ -918,44 +963,43 @@ async fn dispatch_click(
     };
 
     // Press
-    client
-        .send_command_typed::<_, Value>(
-            "Input.dispatchMouseEvent",
-            &DispatchMouseEventParams {
-                event_type: "mousePressed".to_string(),
-                x,
-                y,
-                button: Some(button.to_string()),
-                buttons: Some(button_value),
-                click_count: Some(click_count),
-                delta_x: None,
-                delta_y: None,
-                modifiers: None,
-            },
-            Some(session_id),
-        )
-        .await?;
+    if dispatch_mouse_or_dialog(
+        client,
+        session_id,
+        &DispatchMouseEventParams {
+            event_type: "mousePressed".to_string(),
+            x,
+            y,
+            button: Some(button.to_string()),
+            buttons: Some(button_value),
+            click_count: Some(click_count),
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        },
+    )
+    .await?
+    {
+        return Ok(true);
+    }
 
     // Release
-    client
-        .send_command_typed::<_, Value>(
-            "Input.dispatchMouseEvent",
-            &DispatchMouseEventParams {
-                event_type: "mouseReleased".to_string(),
-                x,
-                y,
-                button: Some(button.to_string()),
-                buttons: Some(0),
-                click_count: Some(click_count),
-                delta_x: None,
-                delta_y: None,
-                modifiers: None,
-            },
-            Some(session_id),
-        )
-        .await?;
-
-    Ok(())
+    dispatch_mouse_or_dialog(
+        client,
+        session_id,
+        &DispatchMouseEventParams {
+            event_type: "mouseReleased".to_string(),
+            x,
+            y,
+            button: Some(button.to_string()),
+            buttons: Some(0),
+            click_count: Some(click_count),
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        },
+    )
+    .await
 }
 
 fn char_to_key_info(ch: char) -> (String, String, i32) {

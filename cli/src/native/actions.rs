@@ -1282,6 +1282,24 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         );
     }
 
+    // A pending confirm/prompt dialog blocks the renderer's main thread, so
+    // any command that touches the page would hang until the client read
+    // timeout. Fail fast with instructions instead. Actions in skip_launch
+    // never touch the page; dialog/screenshot/url/title are browser-side.
+    if let Some(ref dialog) = state.pending_dialog {
+        let safe_during_dialog =
+            skip_launch || matches!(action, "dialog" | "screenshot" | "url" | "title");
+        if !safe_during_dialog {
+            return error_response(
+                &id,
+                &format!(
+                    "A JavaScript {} dialog is blocking the page: \"{}\". Resolve it with `dialog accept` or `dialog dismiss`, then retry `{}`.",
+                    dialog.dialog_type, dialog.message, action
+                ),
+            );
+        }
+    }
+
     let result = match action {
         "launch" => handle_launch(cmd, state).await,
         "navigate" => handle_navigate(cmd, state).await,
@@ -1452,6 +1470,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
+
+    // Re-drain so a dialog opened by THIS command is reflected in the warning
+    // below; events are otherwise only drained at the start of a command.
+    state.drain_cdp_events_background().await;
 
     // Auto-report pending JavaScript dialog so agents know why commands may hang
     if action != "dialog" {
@@ -2686,7 +2708,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
-    interaction::click(
+    let dialog_opened = interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -2697,6 +2719,9 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     )
     .await?;
 
+    if dialog_opened {
+        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+    }
     Ok(json!({ "clicked": selector }))
 }
 
@@ -2708,7 +2733,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::dblclick(
+    let dialog_opened = interaction::dblclick(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -2716,6 +2741,9 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
+    if dialog_opened {
+        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+    }
     Ok(json!({ "clicked": selector }))
 }
 
@@ -4680,8 +4708,12 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .unwrap_or(true);
     let prompt_text = cmd.get("promptText").and_then(|v| v.as_str());
 
-    mgr.handle_dialog(accept, prompt_text).await?;
+    // Clear tracked state even if Chrome reports no dialog (e.g. it was
+    // already resolved and the closed event was missed); otherwise a stale
+    // pending_dialog would make every page command fail fast forever.
+    let result = mgr.handle_dialog(accept, prompt_text).await;
     state.pending_dialog = None;
+    result?;
     Ok(json!({ "handled": true, "accepted": accept }))
 }
 
@@ -5651,7 +5683,7 @@ async fn execute_subaction(
 
     match subaction {
         "click" => {
-            interaction::click(
+            let dialog_opened = interaction::click(
                 &mgr.client,
                 &session_id,
                 &state.ref_map,
@@ -5661,6 +5693,9 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            if dialog_opened {
+                return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+            }
             Ok(json!({ "clicked": selector }))
         }
         "fill" => {

@@ -163,6 +163,7 @@ pub async fn resolve_element_center(
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
+            scroll_node_into_view(client, effective_session_id, backend_node_id).await;
             let result: Result<DomGetBoxModelResult, String> = client
                 .send_command_typed(
                     "DOM.getBoxModel",
@@ -193,6 +194,7 @@ pub async fn resolve_element_center(
             iframe_sessions,
         )
         .await?;
+        scroll_node_into_view(client, effective_session_id, fresh_id).await;
         let result: DomGetBoxModelResult = client
             .send_command_typed(
                 "DOM.getBoxModel",
@@ -211,6 +213,20 @@ pub async fn resolve_element_center(
     // CSS selector
     let (x, y) = resolve_by_selector(client, session_id, selector_or_ref).await?;
     Ok((x, y, session_id.to_string()))
+}
+
+/// Coordinates from DOM.getBoxModel are viewport-relative, and input events
+/// only land inside the viewport, so make sure the node is visible first.
+/// Best effort: a node that cannot be scrolled (display:none, detached) will
+/// fail in DOM.getBoxModel with a clearer error anyway.
+async fn scroll_node_into_view(client: &CdpClient, session_id: &str, backend_node_id: i64) {
+    let _ = client
+        .send_command(
+            "DOM.scrollIntoViewIfNeeded",
+            Some(serde_json::json!({ "backendNodeId": backend_node_id })),
+            Some(session_id),
+        )
+        .await;
 }
 
 pub async fn resolve_element_object_id(
@@ -428,11 +444,21 @@ fn build_count_elements_js(selector: &str) -> String {
 
 fn build_selector_js(selector: &str) -> String {
     let find_expr = build_find_element_js(selector);
+    // Input events dispatch at viewport coordinates, so an element outside the
+    // viewport must be scrolled into view first or the click lands on nothing.
     format!(
         r#"(() => {{
             const el = {find_expr};
             if (!el) return null;
-            const rect = el.getBoundingClientRect();
+            const inView = (r) => r.width > 0 && r.height > 0 &&
+                r.bottom > 0 && r.right > 0 &&
+                r.top < (window.innerHeight || document.documentElement.clientHeight) &&
+                r.left < (window.innerWidth || document.documentElement.clientWidth);
+            let rect = el.getBoundingClientRect();
+            if (!inView(rect)) {{
+                el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }});
+                rect = el.getBoundingClientRect();
+            }}
             return {{ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }};
         }})()"#,
     )
