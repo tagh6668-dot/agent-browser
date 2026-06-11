@@ -417,7 +417,6 @@ async fn run_socket_server(
                 if let Some(ref mut mgr) = s.browser {
                     let _ = mgr.close().await;
                 }
-                let _ = fs::remove_file(&port_path);
                 break;
             }
             _ = reset_rx.recv(), if idle_timeout_ms.is_some() => {
@@ -426,7 +425,6 @@ async fn run_socket_server(
                 continue;
             }
             _ = close_notify.notified() => {
-                let _ = fs::remove_file(&port_path);
                 break;
             }
             _ = shutdown_signal() => {
@@ -434,7 +432,6 @@ async fn run_socket_server(
                 if let Some(ref mut mgr) = s.browser {
                     let _ = mgr.close().await;
                 }
-                let _ = fs::remove_file(&port_path);
                 break;
             }
         }
