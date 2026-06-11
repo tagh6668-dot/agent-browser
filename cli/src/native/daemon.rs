@@ -191,6 +191,21 @@ impl DaemonSidecars {
     }
 }
 
+fn close_sidecar_files(
+    socket_dir: &std::path::Path,
+    session: &str,
+    endpoint_path: PathBuf,
+) -> Vec<PathBuf> {
+    vec![
+        endpoint_path,
+        socket_dir.join(format!("{}.pid", session)),
+        socket_dir.join(format!("{}.version", session)),
+        socket_dir.join(format!("{}.engine", session)),
+        socket_dir.join(format!("{}.provider", session)),
+        socket_dir.join(format!("{}.extensions", session)),
+    ]
+}
+
 #[cfg(unix)]
 async fn run_socket_server(
     socket_path: &PathBuf,
@@ -208,11 +223,11 @@ async fn run_socket_server(
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let sidecars = Arc::new(DaemonSidecars::new(vec![
+    let sidecars = Arc::new(DaemonSidecars::new(close_sidecar_files(
+        &socket_dir,
+        session,
         socket_path.clone(),
-        socket_dir.join(format!("{}.pid", session)),
-        socket_dir.join(format!("{}.version", session)),
-    ]));
+    )));
 
     let stream_file: Option<PathBuf> = if stream_server.is_some() {
         let dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
@@ -342,11 +357,11 @@ async fn run_socket_server(
     let port_path = socket_dir.join(format!("{}.port", session));
     let _ = fs::write(&port_path, actual_port.to_string());
 
-    let sidecars = Arc::new(DaemonSidecars::new(vec![
+    let sidecars = Arc::new(DaemonSidecars::new(close_sidecar_files(
+        socket_dir,
+        session,
         port_path.clone(),
-        socket_dir.join(format!("{}.pid", session)),
-        socket_dir.join(format!("{}.version", session)),
-    ]));
+    )));
 
     let stream_file: Option<PathBuf> = if stream_server.is_some() {
         Some(socket_dir.join(format!("{}.stream", session)))
@@ -770,20 +785,27 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("s.sock");
-        let pid = dir.join("s.pid");
-        fs::write(&sock, "").unwrap();
-        fs::write(&pid, "123").unwrap();
+        let files = close_sidecar_files(&dir, "s", sock.clone());
+        for file in &files {
+            fs::write(file, "").unwrap();
+        }
 
-        let sidecars = DaemonSidecars::new(vec![sock.clone(), pid.clone()]);
+        let sidecars = DaemonSidecars::new(files.clone());
         assert!(!sidecars.is_closing());
 
         sidecars.begin_close();
 
         // The dying daemon must be invisible to ensure_daemon immediately:
-        // no socket to probe, no pid/version files for a successor to lose.
+        // no socket to probe, no pid/version files for a successor to lose,
+        // and no stale stream metadata for discovery to report.
         assert!(sidecars.is_closing());
-        assert!(!sock.exists());
-        assert!(!pid.exists());
+        for file in &files {
+            assert!(
+                !file.exists(),
+                "sidecar should be removed on close: {}",
+                file.display()
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
