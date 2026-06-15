@@ -7,6 +7,7 @@ mod flags;
 mod install;
 mod native;
 mod output;
+mod plugins;
 mod skills;
 #[cfg(test)]
 mod test_utils;
@@ -619,6 +620,15 @@ fn main() {
         return;
     }
 
+    // Handle plugin registry commands (doesn't need daemon)
+    if matches!(
+        clean.first().map(|s| s.as_str()),
+        Some("plugin") | Some("plugins")
+    ) {
+        plugins::run_plugin_command(&clean, &flags.plugins, flags.json);
+        return;
+    }
+
     // Handle session separately (doesn't need daemon)
     if clean.first().map(|s| s.as_str()) == Some("session") {
         run_session(&clean, &flags.session, flags.json);
@@ -696,6 +706,13 @@ fn main() {
         }
     }
 
+    // Send plugin config with commands so an already-running daemon can use
+    // current config without a restart. The daemon strips this from stream
+    // broadcasts before observers see the command payload.
+    if !flags.plugins.is_empty() {
+        cmd["plugins"] = json!(flags.plugins.clone());
+    }
+
     // Validate session name before starting daemon
     if let Some(ref name) = flags.session_name {
         if !validation::is_valid_session_name(name) {
@@ -743,6 +760,11 @@ fn main() {
     } else {
         (None, None, None)
     };
+    let plugin_registry_json = if flags.plugins.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&flags.plugins).unwrap_or_else(|_| "[]".to_string()))
+    };
     let daemon_opts = DaemonOptions {
         headed: flags.headed,
         debug: flags.debug,
@@ -774,6 +796,7 @@ fn main() {
         default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
         no_auto_dialog: flags.no_auto_dialog,
+        plugins: plugin_registry_json.as_deref(),
     };
 
     let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
@@ -1047,6 +1070,9 @@ fn main() {
                 "action": "launch",
                 "provider": provider
             });
+            if !flags.plugins.is_empty() {
+                launch_cmd["plugins"] = json!(flags.plugins.clone());
+            }
 
             if let Some(ref cs) = flags.color_scheme {
                 launch_cmd["colorScheme"] = json!(cs);
@@ -1099,6 +1125,9 @@ fn main() {
             "action": "launch",
             "headless": !flags.headed
         });
+        if !flags.plugins.is_empty() {
+            launch_cmd["plugins"] = json!(flags.plugins.clone());
+        }
 
         let cmd_obj = launch_cmd
             .as_object_mut()

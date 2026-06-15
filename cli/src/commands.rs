@@ -952,9 +952,74 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 Some("login") => {
                     let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "auth login".to_string(),
-                        usage: "agent-browser auth login <name>",
+                        usage: "agent-browser auth login <name> [--credential-provider <plugin>] [--item <ref>] [--url <url>]",
                     })?;
-                    Ok(json!({ "id": id, "action": "auth_login", "name": name }))
+                    let mut credential_provider = None;
+                    let mut credential_item = None;
+                    let mut url = None;
+                    let mut username_selector = None;
+                    let mut password_selector = None;
+                    let mut submit_selector = None;
+
+                    let mut j = 2;
+                    while j < rest.len() {
+                        match rest[j] {
+                            "--credential-provider" => {
+                                credential_provider = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            "--item" => {
+                                credential_item = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            "--url" => {
+                                url = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            "--username-selector" => {
+                                username_selector = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            "--password-selector" => {
+                                password_selector = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            "--submit-selector" => {
+                                submit_selector = rest.get(j + 1).cloned();
+                                j += 1;
+                            }
+                            other => {
+                                if other.starts_with("--") {
+                                    return Err(ParseError::InvalidValue {
+                                        message: format!("unknown flag '{}' for auth login", other),
+                                        usage: "agent-browser auth login <name> [--credential-provider <plugin>] [--item <ref>] [--url <url>]",
+                                    });
+                                }
+                            }
+                        }
+                        j += 1;
+                    }
+
+                    let mut cmd = json!({ "id": id, "action": "auth_login", "name": name });
+                    if let Some(provider) = credential_provider {
+                        cmd["credentialProvider"] = json!(provider);
+                    }
+                    if let Some(item) = credential_item {
+                        cmd["credentialItem"] = json!(item);
+                    }
+                    if let Some(url) = url {
+                        cmd["url"] = json!(url);
+                    }
+                    if let Some(us) = username_selector {
+                        cmd["usernameSelector"] = json!(us);
+                    }
+                    if let Some(ps) = password_selector {
+                        cmd["passwordSelector"] = json!(ps);
+                    }
+                    if let Some(ss) = submit_selector {
+                        cmd["submitSelector"] = json!(ss);
+                    }
+                    Ok(cmd)
                 }
                 Some("list") => Ok(json!({ "id": id, "action": "auth_list" })),
                 Some("delete") | Some("remove") => {
@@ -2796,6 +2861,7 @@ mod tests {
             default_timeout: None,
             no_auto_dialog: false,
             model: None,
+            plugins: Vec::new(),
             verbose: false,
             quiet: false,
         }
@@ -5180,5 +5246,24 @@ mod tests {
     fn test_batch_no_args_no_commands_field() {
         let cmd = parse_command(&args("batch"), &default_flags()).unwrap();
         assert!(cmd.get("commands").is_none());
+    }
+
+    #[test]
+    fn test_auth_login_credential_provider_flags() {
+        let cmd = parse_command(
+            &args(
+                "auth login github --credential-provider onepassword --item GitHub --url https://github.com/login --username-selector #login_field --password-selector #password --submit-selector input[type=submit]",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "auth_login");
+        assert_eq!(cmd["name"], "github");
+        assert_eq!(cmd["credentialProvider"], "onepassword");
+        assert_eq!(cmd["credentialItem"], "GitHub");
+        assert_eq!(cmd["url"], "https://github.com/login");
+        assert_eq!(cmd["usernameSelector"], "#login_field");
+        assert_eq!(cmd["passwordSelector"], "#password");
+        assert_eq!(cmd["submitSelector"], "input[type=submit]");
     }
 }

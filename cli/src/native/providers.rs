@@ -19,6 +19,7 @@ pub struct ProviderConnection {
     pub session: Option<ProviderSession>,
     /// If true, the WebSocket IS the page session (no Target.* commands).
     pub direct_page: bool,
+    pub metadata: Option<Value>,
 }
 
 /// Connects to the specified browser provider and returns a CDP WebSocket URL
@@ -31,6 +32,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 ws_url: url,
                 session,
                 direct_page: false,
+                metadata: None,
             })
         }
         "browserless" => {
@@ -39,6 +41,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 ws_url: url,
                 session,
                 direct_page: false,
+                metadata: None,
             })
         }
         "browser-use" | "browseruse" => {
@@ -47,6 +50,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 ws_url: url,
                 session,
                 direct_page: false,
+                metadata: None,
             })
         }
         "kernel" => {
@@ -55,6 +59,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 ws_url: url,
                 session,
                 direct_page: false,
+                metadata: None,
             })
         }
         "agentcore" => {
@@ -63,17 +68,25 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 ws_url: url,
                 session,
                 direct_page: false,
+                metadata: None,
             })
         }
-        _ => Err(format!(
-            "Unknown provider '{}'. Supported: browserbase, browserless, browser-use, kernel, agentcore",
-            provider_name
-        )),
+        _ => connect_plugin_provider(provider_name).await,
     }
 }
 
 /// Close a provider session (call on CDP connect failure).
 pub async fn close_provider_session(session: &ProviderSession) {
+    if let Some(plugin_name) = session.provider.strip_prefix("plugin:") {
+        let plugins = crate::plugins::plugins_from_env();
+        if let Ok(cleanup) = serde_json::from_str::<Value>(&session.session_id) {
+            let _ =
+                crate::plugins::close_browser_provider_with_plugins(plugin_name, &plugins, cleanup)
+                    .await;
+        }
+        return;
+    }
+
     let client = reqwest::Client::new();
     match session.provider.as_str() {
         "browserbase" => {
@@ -129,6 +142,47 @@ pub async fn close_provider_session(session: &ProviderSession) {
         }
         _ => {}
     }
+}
+
+async fn connect_plugin_provider(provider_name: &str) -> Result<ProviderConnection, String> {
+    let plugins = crate::plugins::plugins_from_env();
+    connect_plugin_provider_with_plugins(provider_name, &plugins).await
+}
+
+pub async fn connect_plugin_provider_with_plugins(
+    provider_name: &str,
+    plugins: &[crate::plugins::PluginConfig],
+) -> Result<ProviderConnection, String> {
+    if crate::plugins::find_plugin(&plugins, provider_name).is_none() {
+        return Err(format!(
+            "Unknown provider '{}'. Supported: browserbase, browserless, browser-use, kernel, agentcore, or a configured plugin with browser.provider",
+            provider_name
+        ));
+    }
+
+    let request = json!({
+        "provider": provider_name,
+        "session": env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
+        "launchOptions": {
+            "headed": env::var("AGENT_BROWSER_HEADED").is_ok(),
+            "engine": env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
+            "userAgent": env::var("AGENT_BROWSER_USER_AGENT").ok(),
+            "colorScheme": env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
+        }
+    });
+    let browser =
+        crate::plugins::connect_browser_provider_with_plugins(provider_name, plugins, request)
+            .await?;
+    let session = browser.cleanup.as_ref().map(|cleanup| ProviderSession {
+        provider: format!("plugin:{}", provider_name),
+        session_id: serde_json::to_string(cleanup).unwrap_or_else(|_| "{}".to_string()),
+    });
+    Ok(ProviderConnection {
+        ws_url: browser.cdp_url,
+        session,
+        direct_page: browser.direct_page,
+        metadata: browser.metadata,
+    })
 }
 
 async fn connect_browserbase() -> Result<(String, Option<ProviderSession>), String> {
