@@ -77,11 +77,19 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
 
 /// Close a provider session (call on CDP connect failure).
 pub async fn close_provider_session(session: &ProviderSession) {
+    let plugins = crate::plugins::plugins_from_env();
+    close_provider_session_with_plugins(session, &plugins).await;
+}
+
+/// Close a provider session with the plugin registry that created it.
+pub async fn close_provider_session_with_plugins(
+    session: &ProviderSession,
+    plugins: &[crate::plugins::PluginConfig],
+) {
     if let Some(plugin_name) = session.provider.strip_prefix("plugin:") {
-        let plugins = crate::plugins::plugins_from_env();
         if let Ok(cleanup) = serde_json::from_str::<Value>(&session.session_id) {
             let _ =
-                crate::plugins::close_browser_provider_with_plugins(plugin_name, &plugins, cleanup)
+                crate::plugins::close_browser_provider_with_plugins(plugin_name, plugins, cleanup)
                     .await;
         }
         return;
@@ -866,5 +874,45 @@ mod tests {
         // Should be None after take
         let taken_again = take_agentcore_ws_headers();
         assert!(taken_again.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plugin_provider_cleanup_uses_supplied_registry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("cleanup-request.json");
+        let plugin_path = dir.path().join("mock-cleanup-plugin");
+        std::fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+cat > "$1"
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let session = ProviderSession {
+            provider: "plugin:cloud-browser".to_string(),
+            session_id: r#"{"sessionId":"s1"}"#.to_string(),
+        };
+        let plugins = vec![crate::plugins::PluginConfig {
+            name: "cloud-browser".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: vec![marker_path.to_string_lossy().to_string()],
+            capabilities: vec![crate::plugins::CAPABILITY_BROWSER_PROVIDER.to_string()],
+            ..crate::plugins::PluginConfig::default()
+        }];
+
+        rt.block_on(close_provider_session_with_plugins(&session, &plugins));
+
+        let request = std::fs::read_to_string(marker_path).unwrap();
+        assert!(request.contains(r#""type":"browser.close""#));
+        assert!(request.contains(r#""sessionId":"s1""#));
     }
 }

@@ -201,11 +201,15 @@ async fn invoke_plugin_process(
     timeout_secs: u64,
     expose_plugin_error: bool,
 ) -> Result<serde_json::Value, String> {
-    let mut child = tokio::process::Command::new(&plugin.command)
+    let mut command = tokio::process::Command::new(&plugin.command);
+    command
         .args(&plugin.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start plugin '{}': {}", plugin.name, e))?;
 
@@ -1230,5 +1234,51 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"launch":{"arg
         assert_eq!(mutations[0].extensions, vec!["/tmp/ext".to_string()]);
         assert_eq!(mutations[0].user_agent.as_deref(), Some("plugin-agent"));
         assert_eq!(mutations[0].init_scripts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_plugin_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("plugin-finished");
+        let plugin_path = dir.path().join("mock-slow-plugin");
+        std::fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+cat >/dev/null
+sleep 2
+printf done > "$1"
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let plugin = PluginConfig {
+            name: "slow".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: vec![marker_path.to_string_lossy().to_string()],
+            capabilities: vec![CAPABILITY_COMMAND_RUN.to_string()],
+            ..PluginConfig::default()
+        };
+
+        let err = invoke_plugin(
+            &plugin,
+            "slow.run",
+            CAPABILITY_COMMAND_RUN,
+            json!({}),
+            1,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("timed out"));
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        assert!(!marker_path.exists());
     }
 }

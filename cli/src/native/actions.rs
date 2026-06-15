@@ -183,7 +183,7 @@ struct DrainedEvents {
 /// `storage_state` is handled separately in `handle_launch()`: explicit
 /// `storageState` launches always require a clean local browser so the loaded
 /// state replaces the prior session instead of merging into it.
-fn launch_hash(opts: &LaunchOptions) -> u64 {
+fn launch_hash(opts: &LaunchOptions, plugin_init_scripts: &[String]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -200,6 +200,7 @@ fn launch_hash(opts: &LaunchOptions) -> u64 {
     opts.user_agent.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
+    plugin_init_scripts.hash(&mut h);
     h.finish()
 }
 
@@ -1771,7 +1772,7 @@ async fn auto_launch(
                 }
                 Err(e) => {
                     if let Some(ref ps) = conn.session {
-                        providers::close_provider_session(ps).await;
+                        providers::close_provider_session_with_plugins(ps, &plugins).await;
                     }
                     return Err(format!("Provider '{}' connection failed: {}", p, e));
                 }
@@ -1780,7 +1781,7 @@ async fn auto_launch(
     }
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
-    let hash = launch_hash(&options);
+    let hash = launch_hash(&options, &state.plugin_init_scripts);
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
@@ -2132,7 +2133,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .await?;
     }
 
-    let new_hash = launch_hash(&launch_options);
+    let new_hash = launch_hash(&launch_options, &state.plugin_init_scripts);
 
     // Hash comparison and fast process-exit check are evaluated before the
     // async is_connection_alive to skip the expensive CDP liveness probe
@@ -2276,7 +2277,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     }
                     Err(e) => {
                         if let Some(ref ps) = conn.session {
-                            providers::close_provider_session(ps).await;
+                            providers::close_provider_session_with_plugins(ps, &command_plugins)
+                                .await;
                         }
                         return Err(e);
                     }
@@ -9022,6 +9024,20 @@ mod tests {
         guard.set("AGENT_BROWSER_HIDE_SCROLLBARS", "false");
         let opts = launch_options_from_env();
         assert!(!opts.hide_scrollbars);
+    }
+
+    #[test]
+    fn test_launch_hash_includes_plugin_init_scripts() {
+        let opts = LaunchOptions::default();
+        let no_scripts: Vec<String> = Vec::new();
+        let plugin_scripts = vec![
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });".to_string(),
+        ];
+
+        assert_ne!(
+            launch_hash(&opts, &no_scripts),
+            launch_hash(&opts, &plugin_scripts)
+        );
     }
 
     #[test]
