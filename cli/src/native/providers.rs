@@ -25,6 +25,17 @@ pub struct ProviderConnection {
 /// Connects to the specified browser provider and returns a CDP WebSocket URL
 /// along with session info for cleanup on failure.
 pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection, String> {
+    let plugins = crate::plugins::plugins_from_env();
+    connect_provider_with_plugins(provider_name, &plugins).await
+}
+
+/// Connects to a built-in provider or a plugin provider from the supplied
+/// registry. Callers that already loaded config must use this helper so policy
+/// checks and provider execution consult the same plugin list.
+pub async fn connect_provider_with_plugins(
+    provider_name: &str,
+    plugins: &[crate::plugins::PluginConfig],
+) -> Result<ProviderConnection, String> {
     match provider_name.to_lowercase().as_str() {
         "browserbase" => {
             let (url, session) = connect_browserbase().await?;
@@ -71,7 +82,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
                 metadata: None,
             })
         }
-        _ => connect_plugin_provider(provider_name).await,
+        _ => connect_plugin_provider_with_plugins(provider_name, plugins).await,
     }
 }
 
@@ -152,11 +163,6 @@ pub async fn close_provider_session_with_plugins(
     }
 }
 
-async fn connect_plugin_provider(provider_name: &str) -> Result<ProviderConnection, String> {
-    let plugins = crate::plugins::plugins_from_env();
-    connect_plugin_provider_with_plugins(provider_name, &plugins).await
-}
-
 pub async fn connect_plugin_provider_with_plugins(
     provider_name: &str,
     plugins: &[crate::plugins::PluginConfig],
@@ -172,7 +178,7 @@ pub async fn connect_plugin_provider_with_plugins(
         "provider": provider_name,
         "session": env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
         "launchOptions": {
-            "headed": env::var("AGENT_BROWSER_HEADED").is_ok(),
+            "headed": env_var_is_truthy("AGENT_BROWSER_HEADED"),
             "engine": env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             "userAgent": env::var("AGENT_BROWSER_USER_AGENT").ok(),
             "colorScheme": env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
@@ -191,6 +197,13 @@ pub async fn connect_plugin_provider_with_plugins(
         direct_page: browser.direct_page,
         metadata: browser.metadata,
     })
+}
+
+fn env_var_is_truthy(name: &str) -> bool {
+    match env::var(name) {
+        Ok(val) => !matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | ""),
+        Err(_) => false,
+    }
 }
 
 async fn connect_browserbase() -> Result<(String, Option<ProviderSession>), String> {
@@ -812,11 +825,30 @@ async fn close_agentcore_session(session_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::EnvGuard;
 
     #[test]
     fn test_connect_provider_unknown() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_PLUGINS"]);
+        guard.remove("AGENT_BROWSER_PLUGINS");
+
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(connect_provider("unknown-provider"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown provider"));
+    }
+
+    #[test]
+    fn test_connect_provider_with_supplied_registry_does_not_fallback_to_env_plugins() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_PLUGINS"]);
+        guard.set(
+            "AGENT_BROWSER_PLUGINS",
+            r#"[{"name":"env-cloud","command":"should-not-run","capabilities":["browser.provider"]}]"#,
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(connect_provider_with_plugins("env-cloud", &[]));
+
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown provider"));
     }
@@ -914,5 +946,51 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let request = std::fs::read_to_string(marker_path).unwrap();
         assert!(request.contains(r#""type":"browser.close""#));
         assert!(request.contains(r#""sessionId":"s1""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plugin_provider_falsey_headed_env_is_false() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_HEADED",
+            "AGENT_BROWSER_ENGINE",
+            "AGENT_BROWSER_SESSION",
+        ]);
+        guard.set("AGENT_BROWSER_HEADED", "false");
+        guard.set("AGENT_BROWSER_ENGINE", "chrome");
+        guard.set("AGENT_BROWSER_SESSION", "provider-test");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let request_path = dir.path().join("browser-launch-request.json");
+        let plugin_path = dir.path().join("mock-provider-plugin");
+        std::fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+cat > "$1"
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cdpUrl":"ws://127.0.0.1:9222/devtools/browser/test"}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let plugins = vec![crate::plugins::PluginConfig {
+            name: "cloud-browser".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: vec![request_path.to_string_lossy().to_string()],
+            capabilities: vec![crate::plugins::CAPABILITY_BROWSER_PROVIDER.to_string()],
+            ..crate::plugins::PluginConfig::default()
+        }];
+
+        rt.block_on(connect_provider_with_plugins("cloud-browser", &plugins))
+            .unwrap();
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(request_path).unwrap()).unwrap();
+        assert_eq!(request["request"]["launchOptions"]["headed"], false);
     }
 }

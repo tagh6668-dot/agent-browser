@@ -1739,11 +1739,7 @@ async fn auto_launch(
         let p = provider.to_lowercase();
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
-            let conn = if crate::plugins::find_plugin(&plugins, &p).is_some() {
-                providers::connect_plugin_provider_with_plugins(&p, &plugins).await?
-            } else {
-                providers::connect_provider(&p).await?
-            };
+            let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
             let ws_headers = if p == "agentcore" {
                 providers::take_agentcore_ws_headers()
             } else {
@@ -2223,12 +2219,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }
             _ => {
                 let command_plugins = plugins_from_command_or_env(cmd);
-                let conn = if crate::plugins::find_plugin(&command_plugins, provider).is_some() {
-                    providers::connect_plugin_provider_with_plugins(provider, &command_plugins)
-                        .await?
-                } else {
-                    providers::connect_provider(provider).await?
-                };
+                let conn =
+                    providers::connect_provider_with_plugins(provider, &command_plugins).await?;
                 let provider_metadata = conn.metadata.clone();
 
                 let ws_headers = if provider.eq_ignore_ascii_case("agentcore") {
