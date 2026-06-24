@@ -970,10 +970,8 @@ fn filter_markdown_sections(body: &str, filter: &str, no_match_message: &str) ->
         current.push('\n');
     }
 
-    if !current.trim().is_empty() {
-        if current.to_ascii_lowercase().contains(&needle) {
-            sections.push(current.trim().to_string());
-        }
+    if !current.trim().is_empty() && current.to_ascii_lowercase().contains(&needle) {
+        sections.push(current.trim().to_string());
     }
 
     if !sections.is_empty() {
