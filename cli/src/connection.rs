@@ -588,12 +588,25 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn daemon_config_matches(session: &str, opts: &DaemonOptions) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonConfigStatus {
+    Matches,
+    Missing,
+    Different,
+}
+
+fn daemon_config_status(session: &str, opts: &DaemonOptions) -> DaemonConfigStatus {
     let expected = daemon_config_fingerprint(opts);
-    fs::read_to_string(get_config_path(session))
-        .ok()
-        .map(|actual| actual.trim() == expected)
-        .unwrap_or(false)
+    match fs::read_to_string(get_config_path(session)) {
+        Ok(actual) if actual.trim() == expected => DaemonConfigStatus::Matches,
+        Ok(_) => DaemonConfigStatus::Different,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DaemonConfigStatus::Missing,
+        Err(_) => DaemonConfigStatus::Different,
+    }
+}
+
+fn daemon_config_matches(session: &str, opts: &DaemonOptions) -> bool {
+    daemon_config_status(session, opts) == DaemonConfigStatus::Matches
 }
 
 fn write_daemon_config(session: &str, opts: &DaemonOptions) {
@@ -629,6 +642,30 @@ fn ready_spawned_daemon_result(
     }
 
     None
+}
+
+fn ready_existing_daemon_result(
+    session: &str,
+    opts: &DaemonOptions,
+    timeout: Duration,
+) -> Option<DaemonResult> {
+    match daemon_config_status(session, opts) {
+        DaemonConfigStatus::Matches => Some(DaemonResult {
+            already_running: true,
+            restarted: false,
+        }),
+        DaemonConfigStatus::Missing => {
+            if wait_for_matching_ready_daemon(session, opts, timeout) {
+                Some(DaemonResult {
+                    already_running: true,
+                    restarted: false,
+                })
+            } else {
+                None
+            }
+        }
+        DaemonConfigStatus::Different => None,
+    }
 }
 
 fn wait_for_matching_ready_daemon(session: &str, opts: &DaemonOptions, timeout: Duration) -> bool {
@@ -763,14 +800,14 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
             stop_existing_daemon_for_restart(session);
             restarted = true;
             // Fall through to spawn a new daemon below
-        } else if !daemon_config_matches(session, opts) {
-            stop_existing_daemon_for_restart(session);
-            restarted = true;
         } else {
-            return Ok(DaemonResult {
-                already_running: true,
-                restarted: false,
-            });
+            match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
+                Some(result) => return Ok(result),
+                None => {
+                    stop_existing_daemon_for_restart(session);
+                    restarted = true;
+                }
+            }
         }
     }
 
@@ -1293,6 +1330,33 @@ mod tests {
 
         let result = ready_spawned_daemon_result(session, &opts, Some(67890), false)
             .expect("matching winner config should be reused");
+
+        assert!(result.already_running);
+        assert!(!result.restarted);
+        assert!(daemon_config_matches(session, &opts));
+    }
+
+    #[test]
+    fn test_ready_existing_daemon_waits_for_startup_config() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "startup-config";
+        let opts = test_daemon_options(Some("1000"), false, None);
+        fs::create_dir_all(get_socket_dir()).unwrap();
+
+        let config_path = get_config_path(session);
+        let expected = daemon_config_fingerprint(&opts);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(config_path, expected).unwrap();
+        });
+
+        let result = ready_existing_daemon_result(session, &opts, Duration::from_secs(1))
+            .expect("missing config should get a short startup settle window");
+        writer.join().unwrap();
 
         assert!(result.already_running);
         assert!(!result.restarted);
