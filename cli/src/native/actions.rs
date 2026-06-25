@@ -9,7 +9,7 @@ use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
-use crate::connection::get_socket_dir;
+use crate::connection::{get_socket_dir, INTERNAL_DAEMON_SHUTDOWN_ACTION};
 use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::auth;
@@ -244,6 +244,15 @@ fn launch_connection_identity(
         return ("provider", Some(provider.to_ascii_lowercase()));
     }
     ("local", None)
+}
+
+fn launch_connection_is_external(
+    cdp_url: Option<&str>,
+    cdp_port: Option<u64>,
+    auto_connect: bool,
+    provider_name: Option<&str>,
+) -> bool {
+    launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
 }
 
 pub struct DaemonState {
@@ -1452,6 +1461,10 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
 }
 
 fn skip_launch_action(action: &str) -> bool {
+    if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
+        return true;
+    }
+
     matches!(
         action,
         "" | "launch"
@@ -1540,6 +1553,15 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     if let Err(err) = apply_restore_config_from_command(cmd, state) {
         return error_response(&id, &err);
+    }
+
+    if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
+        let mut resp = match handle_close(state).await {
+            Ok(data) => success_response(&id, data),
+            Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
+        };
+        inject_lifecycle(&mut resp, state, false, false, false);
+        return resp;
     }
 
     if let Some(ref server) = state.stream_server {
@@ -2663,7 +2685,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // async is_connection_alive to skip the expensive CDP liveness probe
     // when a relaunch is already certain.
     let needs_relaunch = if let Some(ref mut mgr) = state.browser {
-        let is_external = cdp_url.is_some() || cdp_port.is_some() || auto_connect;
+        let is_external =
+            launch_connection_is_external(cdp_url, cdp_port, auto_connect, provider_name);
         let was_external = mgr.is_cdp_connection();
         let hash_changed = state.launch_hash != Some(new_hash);
         let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
@@ -10380,6 +10403,25 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 Some("kernel")
             )
         );
+    }
+
+    #[test]
+    fn test_launch_connection_is_external_includes_provider() {
+        assert!(!launch_connection_is_external(None, None, false, None));
+        assert!(launch_connection_is_external(
+            Some("ws://localhost:9222/devtools/browser/1"),
+            None,
+            false,
+            None
+        ));
+        assert!(launch_connection_is_external(None, Some(9222), false, None));
+        assert!(launch_connection_is_external(None, None, true, None));
+        assert!(launch_connection_is_external(
+            None,
+            None,
+            false,
+            Some("browserbase")
+        ));
     }
 
     #[test]

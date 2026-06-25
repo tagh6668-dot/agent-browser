@@ -19,6 +19,8 @@ use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
+pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__agent_browser_internal_shutdown";
+
 #[derive(Serialize)]
 #[allow(dead_code)]
 pub struct Request {
@@ -674,7 +676,7 @@ fn wait_for_daemon_exit(session: &str, timeout: Duration) -> bool {
 fn request_graceful_daemon_shutdown(session: &str) -> bool {
     let close_cmd = json!({
         "id": "restart-close",
-        "action": "close"
+        "action": INTERNAL_DAEMON_SHUTDOWN_ACTION
     });
 
     match send_command(close_cmd, session) {
