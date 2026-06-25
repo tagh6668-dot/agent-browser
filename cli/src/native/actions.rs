@@ -190,11 +190,22 @@ struct DrainedEvents {
 /// `storage_state` is handled separately in `handle_launch()`: explicit
 /// `storageState` launches always require a clean local browser so the loaded
 /// state replaces the prior session instead of merging into it.
-fn launch_hash(opts: &LaunchOptions, plugin_init_scripts: &[String]) -> u64 {
+fn launch_hash(
+    opts: &LaunchOptions,
+    plugin_init_scripts: &[String],
+    enable_features: &[String],
+    init_script_paths: &[String],
+    engine: Option<&str>,
+    connection_kind: &str,
+    connection_target: Option<&str>,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut h = DefaultHasher::new();
+    engine.hash(&mut h);
+    connection_kind.hash(&mut h);
+    connection_target.hash(&mut h);
     opts.headless.hash(&mut h);
     opts.extensions.hash(&mut h);
     opts.profile.hash(&mut h);
@@ -207,8 +218,31 @@ fn launch_hash(opts: &LaunchOptions, plugin_init_scripts: &[String]) -> u64 {
     opts.user_agent.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
+    enable_features.hash(&mut h);
+    init_script_paths.hash(&mut h);
     plugin_init_scripts.hash(&mut h);
     h.finish()
+}
+
+fn launch_connection_identity(
+    cdp_url: Option<&str>,
+    cdp_port: Option<u64>,
+    auto_connect: bool,
+    provider_name: Option<&str>,
+) -> (&'static str, Option<String>) {
+    if let Some(url) = cdp_url {
+        return ("cdp-url", Some(url.to_string()));
+    }
+    if let Some(port) = cdp_port {
+        return ("cdp-port", Some(port.to_string()));
+    }
+    if auto_connect {
+        return ("auto-connect", None);
+    }
+    if let Some(provider) = provider_name {
+        return ("provider", Some(provider.to_ascii_lowercase()));
+    }
+    ("local", None)
 }
 
 pub struct DaemonState {
@@ -221,6 +255,17 @@ pub struct DaemonState {
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
     pub event_tracker: EventTracker,
     pub session_name: Option<String>,
+    pub restore_save: String,
+    pub restore_check_url: Option<String>,
+    pub restore_check_text: Option<String>,
+    pub restore_check_fn: Option<String>,
+    pub restore_status: String,
+    pub restore_status_detail: Option<String>,
+    pub restore_loaded_path: Option<String>,
+    pub restore_load_failed: bool,
+    pub restore_validation_pending: bool,
+    pub restore_save_status: String,
+    pub restore_saved_path: Option<String>,
     pub session_id: String,
     pub tracing_state: TracingState,
     pub recording_state: RecordingState,
@@ -300,6 +345,19 @@ impl DaemonState {
             )),
             event_tracker: EventTracker::new(),
             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
+            restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
+                .ok()
+                .unwrap_or_else(|| "auto".to_string()),
+            restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL").ok(),
+            restore_check_text: env::var("AGENT_BROWSER_RESTORE_CHECK_TEXT").ok(),
+            restore_check_fn: env::var("AGENT_BROWSER_RESTORE_CHECK_FN").ok(),
+            restore_status: "not_configured".to_string(),
+            restore_status_detail: None,
+            restore_loaded_path: None,
+            restore_load_failed: false,
+            restore_validation_pending: false,
+            restore_save_status: "not_attempted".to_string(),
+            restore_saved_path: None,
             session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
@@ -1230,6 +1288,29 @@ fn plugins_from_command_or_env(cmd: &Value) -> Vec<crate::plugins::PluginConfig>
         .unwrap_or_else(crate::plugins::plugins_from_env)
 }
 
+fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) {
+    if let Some(restore_key) = cmd.get("restoreKey").and_then(|v| v.as_str()) {
+        if !restore_key.is_empty() {
+            state.session_name = Some(restore_key.to_string());
+            if state.restore_status == "not_configured" {
+                state.restore_status = "pending".to_string();
+            }
+        }
+    }
+    if let Some(save_policy) = cmd.get("restoreSave").and_then(|v| v.as_str()) {
+        state.restore_save = save_policy.to_string();
+    }
+    if let Some(check) = cmd.get("restoreCheckUrl").and_then(|v| v.as_str()) {
+        state.restore_check_url = Some(check.to_string());
+    }
+    if let Some(check) = cmd.get("restoreCheckText").and_then(|v| v.as_str()) {
+        state.restore_check_text = Some(check.to_string());
+    }
+    if let Some(check) = cmd.get("restoreCheckFn").and_then(|v| v.as_str()) {
+        state.restore_check_fn = Some(check.to_string());
+    }
+}
+
 fn remember_active_provider_session(
     state: &mut DaemonState,
     session: Option<providers::ProviderSession>,
@@ -1305,6 +1386,7 @@ fn skip_launch_action(action: &str) -> bool {
             | "stream_enable"
             | "stream_disable"
             | "stream_status"
+            | "session_info"
     )
 }
 
@@ -1361,12 +1443,25 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     let cmd_start = std::time::Instant::now();
 
+    apply_restore_config_from_command(cmd, state);
+
     if let Some(ref server) = state.stream_server {
         let mut broadcast_cmd;
-        let cmd_for_broadcast = if cmd.get("plugins").is_some() {
+        let has_internal_fields = cmd.get("plugins").is_some()
+            || cmd.get("restoreKey").is_some()
+            || cmd.get("restoreSave").is_some()
+            || cmd.get("restoreCheckUrl").is_some()
+            || cmd.get("restoreCheckText").is_some()
+            || cmd.get("restoreCheckFn").is_some();
+        let cmd_for_broadcast = if has_internal_fields {
             broadcast_cmd = cmd.clone();
             if let Some(obj) = broadcast_cmd.as_object_mut() {
                 obj.remove("plugins");
+                obj.remove("restoreKey");
+                obj.remove("restoreSave");
+                obj.remove("restoreCheckUrl");
+                obj.remove("restoreCheckText");
+                obj.remove("restoreCheckFn");
             }
             &broadcast_cmd
         } else {
@@ -1395,6 +1490,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     } else {
         false
     };
+    let mut lifecycle_reused = false;
+    let mut lifecycle_launched = false;
+    let mut lifecycle_relaunched_browser = false;
     let policy_actions = policy_actions_for_command(cmd, action, needs_launch);
 
     // Hot-reload and check action policy
@@ -1466,12 +1564,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     if !skip_launch {
         if needs_launch {
+            lifecycle_relaunched_browser =
+                state.browser.is_some() || state.active_provider_session.is_some();
             if state.browser.is_some() || state.active_provider_session.is_some() {
+                let _ = auto_save_restore_state(state).await;
                 let _ = close_current_browser(state).await;
             }
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
                 return error_response(&id, &format!("Auto-launch failed: {}", e));
             }
+            lifecycle_launched = true;
+        } else {
+            lifecycle_reused = true;
         }
 
         if let Some(ref mut mgr) = state.browser {
@@ -1585,6 +1689,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "offline" => handle_offline(cmd, state).await,
         "console" => handle_console(cmd, state).await,
         "errors" => handle_errors(state).await,
+        "session_info" => handle_session_info(state).await,
         "state_save" => handle_state_save(cmd, state).await,
         "state_load" => handle_state_load(cmd, state).await,
         "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
@@ -1709,10 +1814,21 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
+    if result.is_ok() {
+        validate_restore_if_pending(state).await;
+    }
+
     let mut resp = match result {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
+    inject_lifecycle(
+        &mut resp,
+        state,
+        lifecycle_reused,
+        lifecycle_launched,
+        lifecycle_relaunched_browser,
+    );
 
     // Re-drain so a dialog opened by THIS command is reflected in the warning
     // below; events are otherwise only drained at the start of a command.
@@ -1791,6 +1907,8 @@ async fn auto_launch(
         options.viewport_size = Some(server.viewport().await);
     }
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
+    let enable_features = launch_enable_features_from_env();
+    let init_script_paths = launch_init_script_paths_from_env();
 
     // Extract storage_state before options is moved into BrowserManager::launch.
     let storage_state_path = options.storage_state.clone();
@@ -1811,26 +1929,46 @@ async fn auto_launch(
 
     if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
+        let hash = launch_hash(
+            &options,
+            &state.plugin_init_scripts,
+            &enable_features,
+            &init_script_paths,
+            engine.as_deref(),
+            "cdp-url",
+            Some(cdp.as_str()),
+        );
         state.reset_input_state();
         state.browser = Some(mgr);
+        state.launch_hash = Some(hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
-        apply_launch_init_scripts(state).await;
+        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         try_load_storage_state(state, &storage_state_path).await;
         return Ok(());
     }
 
     if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
+        let hash = launch_hash(
+            &options,
+            &state.plugin_init_scripts,
+            &enable_features,
+            &init_script_paths,
+            engine.as_deref(),
+            "auto-connect",
+            None,
+        );
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.launch_hash = Some(hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
-        apply_launch_init_scripts(state).await;
+        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         try_load_storage_state(state, &storage_state_path).await;
         return Ok(());
@@ -1859,15 +1997,25 @@ async fn auto_launch(
             };
             match connect_result {
                 Ok(mgr) => {
+                    let hash = launch_hash(
+                        &options,
+                        &state.plugin_init_scripts,
+                        &enable_features,
+                        &init_script_paths,
+                        engine.as_deref(),
+                        "provider",
+                        Some(p.as_str()),
+                    );
                     state.reset_input_state();
                     state.browser = Some(mgr);
+                    state.launch_hash = Some(hash);
                     remember_active_provider_session(state, conn.session.clone(), &plugins);
                     state.subscribe_to_browser_events();
                     state.start_fetch_handler();
                     state.start_dialog_handler();
                     state.update_stream_client().await;
                     write_provider_file(&state.session_id, &p);
-                    apply_launch_init_scripts(state).await;
+                    apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
                     try_auto_restore_state(state).await;
                     try_load_storage_state(state, &storage_state_path).await;
                     return Ok(());
@@ -1884,7 +2032,15 @@ async fn auto_launch(
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
     write_extensions_file_from_paths(&state.session_id, options.extensions.as_deref());
-    let hash = launch_hash(&options, &state.plugin_init_scripts);
+    let hash = launch_hash(
+        &options,
+        &state.plugin_init_scripts,
+        &enable_features,
+        &init_script_paths,
+        engine.as_deref(),
+        "local",
+        None,
+    );
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
@@ -1903,7 +2059,7 @@ async fn auto_launch(
         }
     }
 
-    apply_launch_init_scripts(state).await;
+    apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
     try_load_storage_state(state, &storage_state_path).await;
     Ok(())
@@ -1914,43 +2070,65 @@ async fn auto_launch(
 /// scripts are registered before any page JS runs on the next navigation.
 /// Also evaluates each script on the current page (if any) so the effect is
 /// immediate for already-loaded pages.
-async fn apply_launch_init_scripts(state: &DaemonState) {
+fn launch_enable_features_from_env() -> Vec<String> {
+    env::var("AGENT_BROWSER_ENABLE")
+        .ok()
+        .map(|raw| {
+            raw.split([',', '\n'])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn launch_init_script_paths_from_env() -> Vec<String> {
+    env::var("AGENT_BROWSER_INIT_SCRIPTS")
+        .ok()
+        .map(|raw| {
+            raw.split([',', '\n'])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
+    cmd.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    })
+}
+
+async fn apply_launch_init_scripts(
+    state: &DaemonState,
+    enable_features: &[String],
+    init_script_paths: &[String],
+) {
     let Some(mgr) = state.browser.as_ref() else {
         return;
     };
 
-    // Built-in features via --enable / AGENT_BROWSER_ENABLE.
-    if let Ok(raw) = env::var("AGENT_BROWSER_ENABLE") {
-        for feature in raw
-            .split([',', '\n'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            match feature {
-                "react-devtools" | "react" => {
-                    let _ = mgr.add_script_to_evaluate(react::INSTALL_HOOK_JS).await;
-                }
-                other => {
-                    eprintln!("warning: unknown --enable feature '{}'", other);
-                }
+    for feature in enable_features {
+        match feature.as_str() {
+            "react-devtools" | "react" => {
+                let _ = mgr.add_script_to_evaluate(react::INSTALL_HOOK_JS).await;
+            }
+            other => {
+                eprintln!("warning: unknown --enable feature '{}'", other);
             }
         }
     }
 
-    // User init scripts via --init-script / AGENT_BROWSER_INIT_SCRIPTS.
-    if let Ok(raw) = env::var("AGENT_BROWSER_INIT_SCRIPTS") {
-        for path in raw
-            .split([',', '\n'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            match fs::read_to_string(path) {
-                Ok(source) => {
-                    let _ = mgr.add_script_to_evaluate(&source).await;
-                }
-                Err(e) => {
-                    eprintln!("warning: failed to read --init-script '{}': {}", path, e);
-                }
+    for path in init_script_paths {
+        match fs::read_to_string(path) {
+            Ok(source) => {
+                let _ = mgr.add_script_to_evaluate(&source).await;
+            }
+            Err(e) => {
+                eprintln!("warning: failed to read --init-script '{}': {}", path, e);
             }
         }
     }
@@ -2062,13 +2240,154 @@ fn hide_scrollbars_from_launch_cmd(cmd: &Value) -> bool {
 async fn try_auto_restore_state(state: &mut DaemonState) {
     let session_name = match state.session_name.as_deref() {
         Some(n) if !n.is_empty() => n.to_string(),
-        _ => return,
+        _ => {
+            state.restore_status = "not_configured".to_string();
+            state.restore_status_detail = None;
+            state.restore_loaded_path = None;
+            state.restore_load_failed = false;
+            state.restore_validation_pending = false;
+            return;
+        }
     };
     if let Some(path) = state::find_auto_state_file(&session_name) {
         if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
-                let _ = state::load_state(&mgr.client, session_id, &path).await;
+                match state::load_state(&mgr.client, session_id, &path).await {
+                    Ok(()) => {
+                        state.restore_status = "loaded".to_string();
+                        state.restore_status_detail = None;
+                        state.restore_loaded_path = Some(path.clone());
+                        state.restore_load_failed = false;
+                        state.restore_validation_pending = state.restore_check_url.is_some()
+                            || state.restore_check_text.is_some()
+                            || state.restore_check_fn.is_some();
+                    }
+                    Err(err) => {
+                        state.restore_status = "load_failed".to_string();
+                        state.restore_status_detail = Some(err);
+                        state.restore_loaded_path = Some(path);
+                        state.restore_load_failed = true;
+                        state.restore_validation_pending = false;
+                    }
+                }
+                return;
             }
+        }
+    } else {
+        state.restore_status = "missing".to_string();
+        state.restore_status_detail = None;
+        state.restore_loaded_path = None;
+        state.restore_load_failed = false;
+        state.restore_validation_pending = false;
+    }
+}
+
+async fn validate_restore_if_pending(state: &mut DaemonState) {
+    if !state.restore_validation_pending {
+        return;
+    }
+    state.restore_validation_pending = false;
+
+    match validate_restored_state(state).await {
+        Ok(()) => {
+            state.restore_status = "loaded".to_string();
+            state.restore_status_detail = None;
+            state.restore_load_failed = false;
+        }
+        Err(err) => {
+            state.restore_status = "loaded_but_invalid".to_string();
+            state.restore_status_detail = Some(err);
+            state.restore_load_failed = true;
+        }
+    }
+}
+
+async fn validate_restored_state(state: &DaemonState) -> Result<(), String> {
+    let Some(ref mgr) = state.browser else {
+        return Ok(());
+    };
+    let session_id = mgr.active_session_id()?.to_string();
+    let timeout_ms = state.default_timeout_ms.min(2_000);
+
+    if let Some(ref pattern) = state.restore_check_url {
+        let url = mgr.get_url().await.unwrap_or_default();
+        if !route_url_matches(pattern, &url) {
+            return Err(format!(
+                "restore URL validation failed: '{}' did not match '{}'",
+                url, pattern
+            ));
+        }
+    }
+
+    if let Some(ref text) = state.restore_check_text {
+        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+    }
+
+    if let Some(ref expression) = state.restore_check_fn {
+        wait_for_function(&mgr.client, &session_id, expression, timeout_ms).await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn auto_save_restore_state(
+    state: &mut DaemonState,
+) -> Result<Option<String>, String> {
+    validate_restore_if_pending(state).await;
+
+    let Some(session_name) = state.session_name.clone() else {
+        state.restore_save_status = "not_configured".to_string();
+        state.restore_saved_path = None;
+        return Ok(None);
+    };
+
+    match state.restore_save.as_str() {
+        "never" => {
+            state.restore_save_status = "disabled".to_string();
+            state.restore_saved_path = None;
+            return Ok(None);
+        }
+        "auto" if state.restore_load_failed => {
+            state.restore_save_status = "skipped_restore_failed".to_string();
+            state.restore_saved_path = None;
+            return Ok(None);
+        }
+        "auto" | "always" => {}
+        other => {
+            state.restore_save_status = "invalid_policy".to_string();
+            state.restore_saved_path = None;
+            return Err(format!(
+                "Invalid restore save policy '{}'. Use auto, always, or never.",
+                other
+            ));
+        }
+    }
+
+    let Some(ref mgr) = state.browser else {
+        state.restore_save_status = "no_browser".to_string();
+        state.restore_saved_path = None;
+        return Ok(None);
+    };
+    let active_session_id = mgr.active_session_id()?.to_string();
+
+    match state::save_auto_state_transactional(
+        &mgr.client,
+        &active_session_id,
+        &session_name,
+        &state.session_id,
+        mgr.visited_origins(),
+    )
+    .await
+    {
+        Ok(path) => {
+            state.restore_save_status = "saved".to_string();
+            state.restore_saved_path = Some(path.clone());
+            Ok(Some(path))
+        }
+        Err(err) => {
+            state.restore_save_status = "error".to_string();
+            state.restore_saved_path = None;
+            Err(err)
         }
     }
 }
@@ -2133,6 +2452,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
+    let enable_features =
+        string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
+    let init_script_paths = string_array_from_command(cmd, "initScripts")
+        .unwrap_or_else(launch_init_script_paths_from_env);
 
     let extensions: Option<Vec<String>> =
         cmd.get("extensions").and_then(|v| v.as_array()).map(|arr| {
@@ -2142,6 +2465,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         });
     let storage_state = cmd.get("storageState").and_then(|v| v.as_str());
     let storage_state_owned = storage_state.map(|s| s.to_string());
+    let engine = cmd
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
 
     let mut launch_options = LaunchOptions {
         headless,
@@ -2222,7 +2550,17 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .await?;
     }
 
-    let new_hash = launch_hash(&launch_options, &state.plugin_init_scripts);
+    let (connection_kind, connection_target) =
+        launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name);
+    let new_hash = launch_hash(
+        &launch_options,
+        &state.plugin_init_scripts,
+        &enable_features,
+        &init_script_paths,
+        engine.as_deref(),
+        connection_kind,
+        connection_target.as_deref(),
+    );
 
     // Hash comparison and fast process-exit check are evaluated before the
     // async is_connection_alive to skip the expensive CDP liveness probe
@@ -2230,7 +2568,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     let needs_relaunch = if let Some(ref mut mgr) = state.browser {
         let is_external = cdp_url.is_some() || cdp_port.is_some() || auto_connect;
         let was_external = mgr.is_cdp_connection();
-        let hash_changed = !is_external && state.launch_hash != Some(new_hash);
+        let hash_changed = state.launch_hash != Some(new_hash);
         let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
         is_external != was_external
             || hash_changed
@@ -2241,13 +2579,17 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         true
     };
 
+    let had_browser_before_launch =
+        state.browser.is_some() || state.active_provider_session.is_some();
+
     if needs_relaunch {
-        if state.browser.is_some() || state.active_provider_session.is_some() {
+        if had_browser_before_launch {
+            let _ = auto_save_restore_state(state).await;
             close_current_browser(state).await?;
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
-        return Ok(json!({ "launched": true, "reused": true }));
+        return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();
 
@@ -2264,37 +2606,43 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(url) = cdp_url {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
+        state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
+        try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
-        apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
     if let Some(port) = cdp_port {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
+        try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
-        apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
     if auto_connect {
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
+        try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
-        apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
     if let Some(provider) = provider_name {
@@ -2332,6 +2680,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     Ok(mgr) => {
                         state.reset_input_state();
                         state.browser = Some(mgr);
+                        state.launch_hash = Some(new_hash);
                         remember_active_provider_session(
                             state,
                             conn.session.clone(),
@@ -2342,12 +2691,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         state.start_dialog_handler();
                         state.update_stream_client().await;
                         write_provider_file(&state.session_id, provider);
+                        apply_launch_init_scripts(state, &enable_features, &init_script_paths)
+                            .await;
+                        try_auto_restore_state(state).await;
                         load_storage_state_or_rollback(state, &storage_state_owned).await?;
-                        apply_launch_init_scripts(state).await;
 
                         if let Some(info) = providers::get_agentcore_info() {
                             return Ok(json!({
                                 "launched": true,
+                                "relaunchedBrowser": had_browser_before_launch,
                                 "provider": provider,
                                 "agentCoreSessionId": info.session_id,
                                 "agentCoreLiveViewUrl": info.live_view_url
@@ -2357,12 +2709,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         if let Some(metadata) = provider_metadata {
                             return Ok(json!({
                                 "launched": true,
+                                "relaunchedBrowser": had_browser_before_launch,
                                 "provider": provider,
                                 "providerMetadata": metadata
                             }));
                         }
 
-                        return Ok(json!({ "launched": true, "provider": provider }));
+                        return Ok(
+                            json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch, "provider": provider }),
+                        );
                     }
                     Err(e) => {
                         if let Some(ref ps) = conn.session {
@@ -2375,12 +2730,6 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }
         }
     }
-
-    let engine = cmd
-        .get("engine")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
 
     // Store proxy credentials for Fetch.authRequired handling
     let has_proxy_auth = launch_options.proxy_username.is_some();
@@ -2445,14 +2794,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
+    apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
+    try_auto_restore_state(state).await;
+
     // Load storage state only after Fetch interception is active so replayed
     // origin navigations go through the same domain and proxy handling as
-    // normal browser traffic.
+    // normal browser traffic. Explicit storage state wins over auto-restore.
     load_storage_state_or_rollback(state, &storage_state_owned).await?;
 
-    apply_launch_init_scripts(state).await;
-
-    Ok(json!({ "launched": true }))
+    Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }))
 }
 
 async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -2776,21 +3126,7 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
-    if let Some(ref mgr) = state.browser {
-        if let Some(ref session_name) = state.session_name {
-            if let Ok(session_id) = mgr.active_session_id() {
-                let _ = state::save_state(
-                    &mgr.client,
-                    session_id,
-                    None,
-                    Some(session_name.as_str()),
-                    &state.session_id,
-                    mgr.visited_origins(),
-                )
-                .await;
-            }
-        }
-    }
+    let save_result = auto_save_restore_state(state).await;
     close_current_browser(state).await?;
 
     // Stop background Fetch handler
@@ -2822,7 +3158,25 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     }
 
     state.ref_map.clear();
-    Ok(json!({ "closed": true }))
+    match save_result {
+        Ok(Some(path)) => Ok(json!({
+            "closed": true,
+            "restoreStatus": state.restore_status,
+            "saveStatus": state.restore_save_status,
+            "statePath": path
+        })),
+        Ok(None) => Ok(json!({
+            "closed": true,
+            "restoreStatus": state.restore_status,
+            "saveStatus": state.restore_save_status
+        })),
+        Err(err) => Ok(json!({
+            "closed": true,
+            "restoreStatus": state.restore_status,
+            "saveStatus": state.restore_save_status,
+            "saveError": err
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3904,6 +4258,36 @@ async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 
 async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
     Ok(state.event_tracker.get_errors_json())
+}
+
+async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
+    Ok(json!({
+        "session": state.session_id,
+        "namespace": env::var("AGENT_BROWSER_NAMESPACE").ok(),
+        "socketDir": get_socket_dir().to_string_lossy(),
+        "backgroundPid": std::process::id(),
+        "browserLaunched": state.browser.is_some(),
+        "pageCount": state.browser.as_ref().map(|mgr| mgr.page_count()).unwrap_or(0),
+        "engine": state.engine,
+        "launchHash": state.launch_hash,
+        "compatibilityStatus": "current",
+        "effectiveLaunch": {
+            "browserLaunched": state.browser.is_some(),
+            "engine": state.engine,
+            "launchHash": state.launch_hash,
+        },
+        "restoreKey": state.session_name,
+        "restoreStatus": state.restore_status,
+        "restoreStatusDetail": state.restore_status_detail,
+        "restoreLoadedPath": state.restore_loaded_path,
+        "restoreValidationPending": state.restore_validation_pending,
+        "restoreSave": state.restore_save,
+        "saveStatus": state.restore_save_status,
+        "restoreSavedPath": state.restore_saved_path,
+        "restoreCheckUrl": state.restore_check_url,
+        "restoreCheckText": state.restore_check_text,
+        "restoreCheckFn": state.restore_check_fn,
+    }))
 }
 
 async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -8111,11 +8495,11 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         ..
     } = cred;
 
+    let auth_timeout_ms = state.timeout_ms(cmd);
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     mgr.navigate(&url, AUTH_LOGIN_WAIT_UNTIL).await?;
 
     let session_id = mgr.active_session_id()?.to_string();
-    let auth_timeout_ms = mgr.default_timeout_ms();
 
     let preferred_user_selectors = [
         "input[type=email]",
@@ -8270,7 +8654,9 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
 
     // Wait for navigation after submit (with fallback timeout)
     let mut rx = mgr.client.subscribe();
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let post_submit_timeout_ms = auth_timeout_ms.min(10_000);
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_millis(post_submit_timeout_ms);
     let mut navigated = false;
 
     loop {
@@ -8293,7 +8679,10 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
     }
 
     if !navigated {
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        let fallback_sleep_ms = auth_timeout_ms.min(2_000);
+        if fallback_sleep_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(fallback_sleep_ms)).await;
+        }
     }
 
     Ok(json!({ "loggedIn": true, "name": name }))
@@ -8766,6 +9155,55 @@ fn success_response(id: &str, data: Value) -> Value {
         "success": true,
         "data": data,
     })
+}
+
+fn inject_lifecycle(
+    resp: &mut Value,
+    state: &DaemonState,
+    reused: bool,
+    launched: bool,
+    relaunched_browser: bool,
+) {
+    if resp.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return;
+    }
+
+    let Some(data) = resp.get_mut("data") else {
+        return;
+    };
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+
+    let data_reused = obj.get("reused").and_then(|v| v.as_bool()).unwrap_or(false);
+    let data_launched = obj
+        .get("launched")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let data_relaunched = obj
+        .get("relaunchedBrowser")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let effective_reused = reused || data_reused;
+    let effective_launched = launched || data_launched;
+    let effective_relaunched = relaunched_browser || data_relaunched;
+
+    obj.insert(
+        "lifecycle".to_string(),
+        json!({
+            "reused": effective_reused,
+            "launched": effective_launched,
+            "relaunchedBrowser": effective_relaunched,
+            "restartedBackground": false,
+            "restoreStatus": state.restore_status,
+            "saveStatus": state.restore_save_status,
+            "effectiveLaunch": {
+                "browserLaunched": state.browser.is_some(),
+                "engine": state.engine,
+                "launchHash": state.launch_hash,
+            }
+        }),
+    );
 }
 
 fn error_response(id: &str, error: &str) -> Value {
@@ -9651,8 +10089,66 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         ];
 
         assert_ne!(
-            launch_hash(&opts, &no_scripts),
-            launch_hash(&opts, &plugin_scripts)
+            launch_hash(&opts, &no_scripts, &[], &[], Some("chrome"), "local", None),
+            launch_hash(
+                &opts,
+                &plugin_scripts,
+                &[],
+                &[],
+                Some("chrome"),
+                "local",
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn test_launch_hash_includes_engine_and_connection_identity() {
+        let opts = LaunchOptions::default();
+
+        assert_ne!(
+            launch_hash(&opts, &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&opts, &[], &[], &[], Some("lightpanda"), "local", None)
+        );
+        assert_ne!(
+            launch_hash(
+                &opts,
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "cdp-url",
+                Some("ws://one")
+            ),
+            launch_hash(
+                &opts,
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "cdp-url",
+                Some("ws://two")
+            )
+        );
+        assert_ne!(
+            launch_hash(
+                &opts,
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "provider",
+                Some("browserbase")
+            ),
+            launch_hash(
+                &opts,
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "provider",
+                Some("kernel")
+            )
         );
     }
 
@@ -9957,18 +10453,19 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_default_timeout_ms_from_env() {
+        let env = EnvGuard::new(&["AGENT_BROWSER_DEFAULT_TIMEOUT"]);
         // When AGENT_BROWSER_DEFAULT_TIMEOUT is set, DaemonState should use it
-        env::set_var("AGENT_BROWSER_DEFAULT_TIMEOUT", "3000");
+        env.set("AGENT_BROWSER_DEFAULT_TIMEOUT", "3000");
         let state = DaemonState::new();
         assert_eq!(state.default_timeout_ms, 3000);
-        env::remove_var("AGENT_BROWSER_DEFAULT_TIMEOUT");
     }
 
     #[test]
     fn test_default_timeout_ms_fallback() {
+        let env = EnvGuard::new(&["AGENT_BROWSER_DEFAULT_TIMEOUT"]);
         // When AGENT_BROWSER_DEFAULT_TIMEOUT is unset, DaemonState uses the
         // documented 25s default (below the CLI's 30s IPC read timeout).
-        env::remove_var("AGENT_BROWSER_DEFAULT_TIMEOUT");
+        env.remove("AGENT_BROWSER_DEFAULT_TIMEOUT");
         let state = DaemonState::new();
         assert_eq!(state.default_timeout_ms, 25_000);
     }

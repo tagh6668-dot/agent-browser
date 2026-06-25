@@ -59,6 +59,12 @@ pub struct Config {
     pub debug: Option<bool>,
     pub session: Option<String>,
     pub session_name: Option<String>,
+    pub restore: Option<String>,
+    pub restore_save: Option<String>,
+    pub restore_check_url: Option<String>,
+    pub restore_check_text: Option<String>,
+    pub restore_check_fn: Option<String>,
+    pub namespace: Option<String>,
     pub executable_path: Option<String>,
     pub extensions: Option<Vec<String>>,
     pub init_scripts: Option<Vec<String>>,
@@ -104,6 +110,12 @@ impl Config {
             debug: other.debug.or(self.debug),
             session: other.session.or(self.session),
             session_name: other.session_name.or(self.session_name),
+            restore: other.restore.or(self.restore),
+            restore_save: other.restore_save.or(self.restore_save),
+            restore_check_url: other.restore_check_url.or(self.restore_check_url),
+            restore_check_text: other.restore_check_text.or(self.restore_check_text),
+            restore_check_fn: other.restore_check_fn.or(self.restore_check_fn),
+            namespace: other.namespace.or(self.namespace),
             executable_path: other.executable_path.or(self.executable_path),
             extensions: match (self.extensions, other.extensions) {
                 (Some(mut a), Some(b)) => {
@@ -229,6 +241,11 @@ fn parse_bool_arg(args: &[String], i: usize) -> (bool, bool) {
 fn extract_config_path(args: &[String]) -> Option<Option<String>> {
     const FLAGS_WITH_VALUE: &[&str] = &[
         "--session",
+        "--restore-save",
+        "--restore-check-url",
+        "--restore-check-text",
+        "--restore-check-fn",
+        "--namespace",
         "--headers",
         "--executable-path",
         "--cdp",
@@ -308,6 +325,13 @@ pub struct Flags {
     pub headed: bool,
     pub debug: bool,
     pub session: String,
+    pub restore: Option<String>,
+    pub restore_save: Option<String>,
+    pub restore_check_url: Option<String>,
+    pub restore_check_text: Option<String>,
+    pub restore_check_fn: Option<String>,
+    pub namespace: Option<String>,
+    pub restore_uses_session: bool,
     pub headers: Option<String>,
     pub executable_path: Option<String>,
     pub cdp: Option<String>,
@@ -365,6 +389,7 @@ pub struct Flags {
     pub cli_annotate: bool,
     pub cli_download_path: bool,
     pub cli_headed: bool,
+    pub cli_restore: bool,
 }
 
 pub fn parse_flags(args: &[String]) -> Flags {
@@ -446,6 +471,23 @@ pub fn parse_flags(args: &[String]) -> Flags {
             .ok()
             .or(config.session)
             .unwrap_or_else(|| "default".to_string()),
+        restore: env::var("AGENT_BROWSER_RESTORE").ok().or(config.restore),
+        restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
+            .ok()
+            .or(config.restore_save),
+        restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL")
+            .ok()
+            .or(config.restore_check_url),
+        restore_check_text: env::var("AGENT_BROWSER_RESTORE_CHECK_TEXT")
+            .ok()
+            .or(config.restore_check_text),
+        restore_check_fn: env::var("AGENT_BROWSER_RESTORE_CHECK_FN")
+            .ok()
+            .or(config.restore_check_fn),
+        namespace: env::var("AGENT_BROWSER_NAMESPACE")
+            .ok()
+            .or(config.namespace),
+        restore_uses_session: false,
         headers: config.headers,
         executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH")
             .ok()
@@ -559,6 +601,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_annotate: false,
         cli_download_path: false,
         cli_headed: false,
+        cli_restore: false,
     };
 
     let mut i = 0;
@@ -589,6 +632,50 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--session" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.session = s.clone();
+                    i += 1;
+                }
+            }
+            "--restore" => {
+                flags.cli_restore = true;
+                let next = args.get(i + 1);
+                if let Some(s) = next {
+                    if !s.starts_with('-') && !looks_like_command(s) {
+                        flags.restore = Some(s.clone());
+                        i += 1;
+                    } else {
+                        flags.restore_uses_session = true;
+                    }
+                } else {
+                    flags.restore_uses_session = true;
+                }
+            }
+            "--restore-save" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.restore_save = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--restore-check-url" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.restore_check_url = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--restore-check-text" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.restore_check_text = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--restore-check-fn" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.restore_check_fn = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--namespace" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.namespace = Some(s.clone());
                     i += 1;
                 }
             }
@@ -880,6 +967,49 @@ pub fn parse_flags(args: &[String]) -> Flags {
     flags
 }
 
+fn looks_like_command(value: &str) -> bool {
+    matches!(
+        value,
+        "open"
+            | "goto"
+            | "navigate"
+            | "read"
+            | "click"
+            | "dblclick"
+            | "fill"
+            | "type"
+            | "press"
+            | "key"
+            | "snapshot"
+            | "screenshot"
+            | "pdf"
+            | "close"
+            | "quit"
+            | "exit"
+            | "session"
+            | "state"
+            | "tab"
+            | "window"
+            | "wait"
+            | "get"
+            | "is"
+            | "find"
+            | "set"
+            | "network"
+            | "stream"
+            | "react"
+            | "vitals"
+            | "batch"
+            | "mcp"
+            | "doctor"
+            | "install"
+            | "upgrade"
+            | "profiles"
+            | "skills"
+            | "dashboard"
+    )
+}
+
 pub fn clean_args(args: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     let mut skip_next = false;
@@ -909,6 +1039,11 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     // Global flags that always take a value (need to skip the next arg too)
     const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
         "--session",
+        "--restore-save",
+        "--restore-check-url",
+        "--restore-check-text",
+        "--restore-check-fn",
+        "--namespace",
         "--headers",
         "--executable-path",
         "--cdp",
@@ -950,6 +1085,15 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         }
         if GLOBAL_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
             skip_next = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--restore" {
+            if let Some(v) = args.get(i + 1) {
+                if !v.starts_with('-') && !looks_like_command(v) {
+                    i += 1;
+                }
+            }
             i += 1;
             continue;
         }
@@ -1076,6 +1220,42 @@ mod tests {
 
         let clean = clean_args(&input);
         assert_eq!(clean, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_parse_restore_without_value_uses_session() {
+        let input = args("--session next-loop --restore open http://localhost:3000");
+        let flags = parse_flags(&input);
+
+        assert_eq!(flags.session, "next-loop");
+        assert!(flags.restore_uses_session);
+        assert!(flags.restore.is_none());
+        assert_eq!(clean_args(&input), vec!["open", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn test_parse_restore_with_explicit_key() {
+        let input = args("--restore login-state open http://localhost:3000");
+        let flags = parse_flags(&input);
+
+        assert_eq!(flags.restore.as_deref(), Some("login-state"));
+        assert!(!flags.restore_uses_session);
+        assert_eq!(clean_args(&input), vec!["open", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn test_parse_restore_policy_checks_and_namespace() {
+        let input = args(
+            "--namespace work-a --restore-save never --restore-check-url **/dashboard --restore-check-text Dashboard --restore-check-fn window.ok open",
+        );
+        let flags = parse_flags(&input);
+
+        assert_eq!(flags.namespace.as_deref(), Some("work-a"));
+        assert_eq!(flags.restore_save.as_deref(), Some("never"));
+        assert_eq!(flags.restore_check_url.as_deref(), Some("**/dashboard"));
+        assert_eq!(flags.restore_check_text.as_deref(), Some("Dashboard"));
+        assert_eq!(flags.restore_check_fn.as_deref(), Some("window.ok"));
+        assert_eq!(clean_args(&input), vec!["open"]);
     }
 
     #[test]

@@ -1,7 +1,9 @@
+use crate::validation::sanitize_session_component;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -92,26 +94,44 @@ impl Connection {
 /// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
 pub fn get_socket_dir() -> PathBuf {
     // 1. Explicit override (ignore empty string)
-    if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
+    let base = if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
         if !dir.is_empty() {
-            return PathBuf::from(dir);
+            PathBuf::from(dir)
+        } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+            if !runtime_dir.is_empty() {
+                PathBuf::from(runtime_dir).join("agent-browser")
+            } else if let Some(home) = dirs::home_dir() {
+                home.join(".agent-browser")
+            } else {
+                env::temp_dir().join("agent-browser")
+            }
+        } else if let Some(home) = dirs::home_dir() {
+            home.join(".agent-browser")
+        } else {
+            env::temp_dir().join("agent-browser")
         }
-    }
-
-    // 2. XDG_RUNTIME_DIR (Linux standard, ignore empty string)
-    if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+    } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join("agent-browser");
+            PathBuf::from(runtime_dir).join("agent-browser")
+        } else if let Some(home) = dirs::home_dir() {
+            home.join(".agent-browser")
+        } else {
+            env::temp_dir().join("agent-browser")
+        }
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".agent-browser")
+    } else {
+        env::temp_dir().join("agent-browser")
+    };
+
+    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
+        let namespace = sanitize_session_component(&namespace);
+        if !namespace.is_empty() {
+            return base.join("namespaces").join(namespace).join("run");
         }
     }
 
-    // 3. Home directory fallback (like Docker Desktop's ~/.docker/run/)
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".agent-browser");
-    }
-
-    // 4. Last resort: temp dir
-    env::temp_dir().join("agent-browser")
+    base
 }
 
 #[cfg(unix)]
@@ -127,12 +147,18 @@ fn get_version_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.version", session))
 }
 
+fn get_config_path(session: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.config", session))
+}
+
 /// Clean up stale socket and PID files for a session
 pub fn cleanup_stale_files(session: &str) {
     let pid_path = get_pid_path(session);
     let _ = fs::remove_file(&pid_path);
     let version_path = get_version_path(session);
     let _ = fs::remove_file(&version_path);
+    let config_path = get_config_path(session);
+    let _ = fs::remove_file(&config_path);
     let stream_path = get_socket_dir().join(format!("{}.stream", session));
     let _ = fs::remove_file(&stream_path);
 
@@ -378,6 +404,9 @@ pub fn daemon_ready(session: &str) -> bool {
 pub struct DaemonResult {
     /// True if we connected to an existing daemon, false if we started a new one
     pub already_running: bool,
+    /// True if an existing daemon was intentionally restarted to satisfy
+    /// current daemon-only configuration.
+    pub restarted: bool,
 }
 
 /// Options forwarded to the daemon process as environment variables.
@@ -405,6 +434,10 @@ pub struct DaemonOptions<'a> {
     pub provider: Option<&'a str>,
     pub device: Option<&'a str>,
     pub session_name: Option<&'a str>,
+    pub restore_save: Option<&'a str>,
+    pub restore_check_url: Option<&'a str>,
+    pub restore_check_text: Option<&'a str>,
+    pub restore_check_fn: Option<&'a str>,
     pub download_path: Option<&'a str>,
     pub allowed_domains: Option<&'a [String]>,
     pub action_policy: Option<&'a str>,
@@ -483,6 +516,18 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
     if let Some(sn) = opts.session_name {
         cmd.env("AGENT_BROWSER_SESSION_NAME", sn);
     }
+    if let Some(policy) = opts.restore_save {
+        cmd.env("AGENT_BROWSER_RESTORE_SAVE", policy);
+    }
+    if let Some(check) = opts.restore_check_url {
+        cmd.env("AGENT_BROWSER_RESTORE_CHECK_URL", check);
+    }
+    if let Some(check) = opts.restore_check_text {
+        cmd.env("AGENT_BROWSER_RESTORE_CHECK_TEXT", check);
+    }
+    if let Some(check) = opts.restore_check_fn {
+        cmd.env("AGENT_BROWSER_RESTORE_CHECK_FN", check);
+    }
     if let Some(dp) = opts.download_path {
         cmd.env("AGENT_BROWSER_DOWNLOAD_PATH", dp);
     }
@@ -516,6 +561,29 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
     if let Some(plugins) = opts.plugins {
         cmd.env("AGENT_BROWSER_PLUGINS", plugins);
     }
+}
+
+fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    opts.debug.hash(&mut hasher);
+    opts.action_policy.hash(&mut hasher);
+    opts.confirm_actions.hash(&mut hasher);
+    opts.idle_timeout.hash(&mut hasher);
+    opts.default_timeout.hash(&mut hasher);
+    opts.no_auto_dialog.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn daemon_config_matches(session: &str, opts: &DaemonOptions) -> bool {
+    let expected = daemon_config_fingerprint(opts);
+    fs::read_to_string(get_config_path(session))
+        .ok()
+        .map(|actual| actual.trim() == expected)
+        .unwrap_or(false)
+}
+
+fn write_daemon_config(session: &str, opts: &DaemonOptions) {
+    let _ = fs::write(get_config_path(session), daemon_config_fingerprint(opts));
 }
 
 /// Check if the running daemon's version matches this CLI binary.
@@ -581,6 +649,8 @@ fn kill_stale_daemon(session: &str) {
 }
 
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    let mut restarted = false;
+
     // Socket connectivity is the sole liveness check — no PID check — so
     // callers in a different PID namespace (e.g. unshare) can still reuse
     // an existing daemon they can reach over the socket.
@@ -599,10 +669,15 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 crate::color::warning_indicator()
             );
             kill_stale_daemon(session);
+            restarted = true;
             // Fall through to spawn a new daemon below
+        } else if !daemon_config_matches(session, opts) {
+            kill_stale_daemon(session);
+            restarted = true;
         } else {
             return Ok(DaemonResult {
                 already_running: true,
+                restarted: false,
             });
         }
     }
@@ -701,8 +776,10 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     for _ in 0..50 {
         if daemon_ready(session) {
+            write_daemon_config(session, opts);
             return Ok(DaemonResult {
                 already_running: false,
+                restarted,
             });
         }
 
@@ -723,8 +800,10 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 {
                     thread::sleep(Duration::from_millis(200));
                     if daemon_ready(session) {
+                        write_daemon_config(session, opts);
                         return Ok(DaemonResult {
                             already_running: true,
+                            restarted,
                         });
                     }
                 }
@@ -955,6 +1034,115 @@ mod tests {
         assert!(result.to_string_lossy().ends_with(".agent-browser"));
         assert!(
             result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
+        );
+    }
+
+    #[test]
+    fn test_get_socket_dir_namespace_scopes_base_directory() {
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+
+        _guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            "/tmp/agent-browser-test-sockets",
+        );
+        _guard.remove("XDG_RUNTIME_DIR");
+        _guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+
+        assert_eq!(
+            get_socket_dir(),
+            PathBuf::from("/tmp/agent-browser-test-sockets")
+                .join("namespaces")
+                .join("worktree-one")
+                .join("run")
+        );
+    }
+
+    #[test]
+    fn test_walk_daemons_only_lists_current_namespace() {
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        _guard.remove("XDG_RUNTIME_DIR");
+
+        let ns_one = dir.path().join("namespaces").join("one").join("run");
+        let ns_two = dir.path().join("namespaces").join("two").join("run");
+        fs::create_dir_all(&ns_one).unwrap();
+        fs::create_dir_all(&ns_two).unwrap();
+        let pid = std::process::id().to_string();
+        fs::write(ns_one.join("current.pid"), &pid).unwrap();
+        fs::write(ns_two.join("other.pid"), &pid).unwrap();
+
+        _guard.set("AGENT_BROWSER_NAMESPACE", "one");
+        let inventory = walk_daemons();
+
+        assert_eq!(inventory.sessions.len(), 1);
+        assert_eq!(inventory.sessions[0].name, "current");
+    }
+
+    fn test_daemon_options<'a>(
+        idle_timeout: Option<&'a str>,
+        no_auto_dialog: bool,
+    ) -> DaemonOptions<'a> {
+        DaemonOptions {
+            headed: false,
+            debug: false,
+            executable_path: None,
+            extensions: &[],
+            init_scripts: &[],
+            enable: &[],
+            args: None,
+            user_agent: None,
+            proxy: None,
+            proxy_bypass: None,
+            proxy_username: None,
+            proxy_password: None,
+            ignore_https_errors: false,
+            allow_file_access: false,
+            hide_scrollbars: true,
+            profile: None,
+            state: None,
+            provider: None,
+            device: None,
+            session_name: None,
+            restore_save: None,
+            restore_check_url: None,
+            restore_check_text: None,
+            restore_check_fn: None,
+            download_path: None,
+            allowed_domains: None,
+            action_policy: None,
+            confirm_actions: None,
+            engine: None,
+            auto_connect: false,
+            idle_timeout,
+            default_timeout: None,
+            cdp: None,
+            no_auto_dialog,
+            plugins: None,
+        }
+    }
+
+    #[test]
+    fn test_daemon_config_fingerprint_tracks_daemon_owned_options() {
+        let base = test_daemon_options(None, false);
+        let idle_changed = test_daemon_options(Some("1000"), false);
+        let dialog_changed = test_daemon_options(None, true);
+
+        assert_ne!(
+            daemon_config_fingerprint(&base),
+            daemon_config_fingerprint(&idle_changed)
+        );
+        assert_ne!(
+            daemon_config_fingerprint(&base),
+            daemon_config_fingerprint(&dialog_changed)
         );
     }
 

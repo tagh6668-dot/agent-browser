@@ -11,7 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::signal;
 use tokio::sync::{mpsc, Notify, RwLock};
 
-use super::actions::{close_current_browser, execute_command, DaemonState};
+use super::actions::{
+    auto_save_restore_state, close_current_browser, execute_command, DaemonState,
+};
 use super::cdp::client::CdpClient;
 use super::state;
 use super::stream::StreamServer;
@@ -225,6 +227,7 @@ async fn run_socket_server(
                 }
             }, if idle_timeout_ms.is_some() => {
                 let mut s = state.lock().await;
+                let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_current_browser(&mut s).await;
                 break;
             }
@@ -241,6 +244,7 @@ async fn run_socket_server(
             }
             _ = shutdown_signal() => {
                 let mut s = state.lock().await;
+                let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_current_browser(&mut s).await;
                 break;
             }
@@ -321,6 +325,7 @@ async fn run_socket_server(
                 }
             }, if idle_timeout_ms.is_some() => {
                 let mut s = state.lock().await;
+                let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_current_browser(&mut s).await;
                 let _ = fs::remove_file(&port_path);
                 break;
@@ -336,6 +341,7 @@ async fn run_socket_server(
             }
             _ = shutdown_signal() => {
                 let mut s = state.lock().await;
+                let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_current_browser(&mut s).await;
                 let _ = fs::remove_file(&port_path);
                 break;
