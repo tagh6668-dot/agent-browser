@@ -103,6 +103,32 @@ fn is_valid_restore_save_policy(policy: &str) -> bool {
     matches!(policy, "auto" | "always" | "never")
 }
 
+fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
+    if flags.cdp.is_some() && flags.provider.is_some() {
+        return Some("Cannot use --cdp and -p/--provider together");
+    }
+
+    if flags.auto_connect && flags.cdp.is_some() {
+        return Some("Cannot use --auto-connect and --cdp together");
+    }
+
+    if flags.auto_connect && flags.provider.is_some() {
+        return Some("Cannot use --auto-connect and -p/--provider together");
+    }
+
+    if flags.provider.is_some() && !flags.extensions.is_empty() {
+        return Some(
+            "Cannot use --extension with -p/--provider (extensions require local browser)",
+        );
+    }
+
+    if flags.cdp.is_some() && !flags.extensions.is_empty() {
+        return Some("Cannot use --extension with --cdp (extensions require local browser)");
+    }
+
+    None
+}
+
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
     if let Some(restore_key) = restore_key_from_flags(flags) {
         cmd["restoreKey"] = json!(restore_key);
@@ -1140,6 +1166,15 @@ fn main() {
         return;
     }
 
+    if let Some(msg) = incompatible_launch_mode_error(&flags) {
+        if flags.json {
+            print_json_error(msg);
+        } else {
+            eprintln!("{} {}", color::error_indicator(), msg);
+        }
+        exit(1);
+    }
+
     // Parse proxy URL to separate server from credentials for the daemon.
     let (proxy_server, proxy_username, proxy_password) = if let Some(ref proxy_str) = flags.proxy {
         let parsed = parse_proxy(proxy_str);
@@ -1200,57 +1235,6 @@ fn main() {
     };
     let _daemon_was_already_running = daemon_result.already_running;
     let daemon_restarted = daemon_result.restarted;
-
-    // Validate mutually exclusive options
-    if flags.cdp.is_some() && flags.provider.is_some() {
-        let msg = "Cannot use --cdp and -p/--provider together";
-        if flags.json {
-            print_json_error(msg);
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
-    }
-
-    if flags.auto_connect && flags.cdp.is_some() {
-        let msg = "Cannot use --auto-connect and --cdp together";
-        if flags.json {
-            print_json_error(msg);
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
-    }
-
-    if flags.auto_connect && flags.provider.is_some() {
-        let msg = "Cannot use --auto-connect and -p/--provider together";
-        if flags.json {
-            print_json_error(msg);
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
-    }
-
-    if flags.provider.is_some() && !flags.extensions.is_empty() {
-        let msg = "Cannot use --extension with -p/--provider (extensions require local browser)";
-        if flags.json {
-            print_json_error(msg);
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
-    }
-
-    if flags.cdp.is_some() && !flags.extensions.is_empty() {
-        let msg = "Cannot use --extension with --cdp (extensions require local browser)";
-        if flags.json {
-            print_json_error(msg);
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
-    }
 
     // Auto-connect to existing browser. This is sent even when the daemon is
     // already running so launch compatibility stays idempotent.
@@ -1967,6 +1951,65 @@ mod tests {
         assert!(cmd["restoreCheckUrl"].is_null());
         assert!(cmd["restoreCheckText"].is_null());
         assert!(cmd["restoreCheckFn"].is_null());
+    }
+
+    fn launch_mode_flags(auto_connect: bool, cdp: bool, provider: bool, extensions: bool) -> Flags {
+        let mut flags = parse_flags(&[]);
+        flags.auto_connect = auto_connect;
+        flags.cdp = cdp.then(|| "9222".to_string());
+        flags.provider = provider.then(|| "ios".to_string());
+        flags.extensions = if extensions {
+            vec!["/tmp/ext".to_string()]
+        } else {
+            Vec::new()
+        };
+        flags
+    }
+
+    #[test]
+    fn test_incompatible_launch_mode_error_matches_existing_messages() {
+        let cases = [
+            (
+                launch_mode_flags(false, true, true, false),
+                "Cannot use --cdp and -p/--provider together",
+            ),
+            (
+                launch_mode_flags(true, true, false, false),
+                "Cannot use --auto-connect and --cdp together",
+            ),
+            (
+                launch_mode_flags(true, false, true, false),
+                "Cannot use --auto-connect and -p/--provider together",
+            ),
+            (
+                launch_mode_flags(false, false, true, true),
+                "Cannot use --extension with -p/--provider (extensions require local browser)",
+            ),
+            (
+                launch_mode_flags(false, true, false, true),
+                "Cannot use --extension with --cdp (extensions require local browser)",
+            ),
+        ];
+
+        for (flags, expected) in cases {
+            assert_eq!(incompatible_launch_mode_error(&flags), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_incompatible_launch_mode_error_allows_compatible_flags() {
+        assert_eq!(
+            incompatible_launch_mode_error(&launch_mode_flags(true, false, false, false)),
+            None
+        );
+        assert_eq!(
+            incompatible_launch_mode_error(&launch_mode_flags(false, true, false, false)),
+            None
+        );
+        assert_eq!(
+            incompatible_launch_mode_error(&launch_mode_flags(false, false, true, false)),
+            None
+        );
     }
 
     #[test]
