@@ -600,6 +600,55 @@ fn write_daemon_config(session: &str, opts: &DaemonOptions) {
     let _ = fs::write(get_config_path(session), daemon_config_fingerprint(opts));
 }
 
+fn daemon_pid_matches(session: &str, expected_pid: u32) -> bool {
+    fs::read_to_string(get_pid_path(session))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        == Some(expected_pid)
+}
+
+fn ready_spawned_daemon_result(
+    session: &str,
+    opts: &DaemonOptions,
+    spawned_pid: Option<u32>,
+    restarted: bool,
+) -> Option<DaemonResult> {
+    if spawned_pid.is_some_and(|pid| daemon_pid_matches(session, pid)) {
+        write_daemon_config(session, opts);
+        return Some(DaemonResult {
+            already_running: false,
+            restarted,
+        });
+    }
+
+    if daemon_config_matches(session, opts) {
+        return Some(DaemonResult {
+            already_running: true,
+            restarted,
+        });
+    }
+
+    None
+}
+
+fn wait_for_matching_ready_daemon(session: &str, opts: &DaemonOptions, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if daemon_config_matches(session, opts) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    daemon_config_matches(session, opts)
+}
+
+fn concurrent_daemon_config_error(session: &str) -> String {
+    format!(
+        "A daemon for session '{}' started concurrently with different daemon configuration. Retry the command so agent-browser can restart it with the requested configuration.",
+        session
+    )
+}
+
 /// Check if the running daemon's version matches this CLI binary.
 /// Returns false when the version file is missing — an unversioned daemon
 /// is most likely a stale leftover from before version tracking was added
@@ -817,13 +866,21 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         );
     }
 
+    let spawned_pid = daemon_child.as_ref().map(|child| child.id());
+
     for _ in 0..50 {
         if daemon_ready(session) {
-            write_daemon_config(session, opts);
-            return Ok(DaemonResult {
-                already_running: false,
-                restarted,
-            });
+            if let Some(result) = ready_spawned_daemon_result(session, opts, spawned_pid, restarted)
+            {
+                return Ok(result);
+            }
+            if wait_for_matching_ready_daemon(session, opts, Duration::from_secs(1)) {
+                return Ok(DaemonResult {
+                    already_running: true,
+                    restarted,
+                });
+            }
+            return Err(concurrent_daemon_config_error(session));
         }
 
         // Detect early daemon exit and surface the real error from stderr
@@ -843,11 +900,13 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 {
                     thread::sleep(Duration::from_millis(200));
                     if daemon_ready(session) {
-                        write_daemon_config(session, opts);
-                        return Ok(DaemonResult {
-                            already_running: true,
-                            restarted,
-                        });
+                        if wait_for_matching_ready_daemon(session, opts, Duration::from_secs(1)) {
+                            return Ok(DaemonResult {
+                                already_running: true,
+                                restarted,
+                            });
+                        }
+                        return Err(concurrent_daemon_config_error(session));
                     }
                 }
 
@@ -1194,6 +1253,72 @@ mod tests {
             daemon_config_fingerprint(&base),
             daemon_config_fingerprint(&domains_changed)
         );
+    }
+
+    #[test]
+    fn test_spawn_race_loser_does_not_overwrite_winner_config() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "race-config";
+        let winner_opts = test_daemon_options(Some("1000"), false, None);
+        let loser_opts = test_daemon_options(Some("2000"), false, None);
+
+        fs::create_dir_all(get_socket_dir()).unwrap();
+        fs::write(get_pid_path(session), "12345").unwrap();
+        write_daemon_config(session, &winner_opts);
+
+        let result = ready_spawned_daemon_result(session, &loser_opts, Some(67890), false);
+
+        assert!(result.is_none());
+        assert!(daemon_config_matches(session, &winner_opts));
+        assert!(!daemon_config_matches(session, &loser_opts));
+    }
+
+    #[test]
+    fn test_spawn_race_loser_reuses_matching_winner_config() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "race-config-match";
+        let opts = test_daemon_options(Some("1000"), false, None);
+
+        fs::create_dir_all(get_socket_dir()).unwrap();
+        fs::write(get_pid_path(session), "12345").unwrap();
+        write_daemon_config(session, &opts);
+
+        let result = ready_spawned_daemon_result(session, &opts, Some(67890), false)
+            .expect("matching winner config should be reused");
+
+        assert!(result.already_running);
+        assert!(!result.restarted);
+        assert!(daemon_config_matches(session, &opts));
+    }
+
+    #[test]
+    fn test_spawn_owner_writes_config() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "race-config-owner";
+        let opts = test_daemon_options(Some("1000"), false, None);
+        let spawned_pid = 67890;
+
+        fs::create_dir_all(get_socket_dir()).unwrap();
+        fs::write(get_pid_path(session), spawned_pid.to_string()).unwrap();
+
+        let result = ready_spawned_daemon_result(session, &opts, Some(spawned_pid), true)
+            .expect("spawn owner should be accepted");
+
+        assert!(!result.already_running);
+        assert!(result.restarted);
+        assert!(daemon_config_matches(session, &opts));
     }
 
     // === Transient Error Detection Tests ===
