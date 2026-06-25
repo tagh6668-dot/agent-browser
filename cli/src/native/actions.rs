@@ -10,6 +10,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
 use crate::connection::get_socket_dir;
+use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
@@ -1351,14 +1352,31 @@ fn reconcile_restore_check_change(
     }
 }
 
-fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) {
+fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) -> Result<(), String> {
+    let restore_key = cmd.get("restoreKey").and_then(|v| v.as_str());
+    if let Some(restore_key) = restore_key {
+        if !restore_key.is_empty() && !is_valid_session_name(restore_key) {
+            return Err(session_name_error(restore_key));
+        }
+    }
+
+    let restore_save = cmd.get("restoreSave").map(|v| v.as_str().unwrap_or("auto"));
+    if let Some(policy) = restore_save {
+        if !matches!(policy, "auto" | "always" | "never") {
+            return Err(format!(
+                "Invalid restore save policy '{}'. Use auto, always, or never.",
+                policy
+            ));
+        }
+    }
+
     let old_checks = (
         state.restore_check_url.clone(),
         state.restore_check_text.clone(),
         state.restore_check_fn.clone(),
     );
 
-    if let Some(restore_key) = cmd.get("restoreKey").and_then(|v| v.as_str()) {
+    if let Some(restore_key) = restore_key {
         if !restore_key.is_empty() {
             if state.session_name.as_deref() != Some(restore_key) {
                 reset_restore_runtime_state(state);
@@ -1369,8 +1387,8 @@ fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) {
             }
         }
     }
-    if let Some(save_policy) = cmd.get("restoreSave") {
-        state.restore_save = save_policy.as_str().unwrap_or("auto").to_string();
+    if let Some(policy) = restore_save {
+        state.restore_save = policy.to_string();
     }
     if let Some(new_checks) = command_restore_check_fields(cmd) {
         state.restore_check_url = new_checks.0.clone();
@@ -1380,6 +1398,8 @@ fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) {
             reconcile_restore_check_change(state, &new_checks);
         }
     }
+
+    Ok(())
 }
 
 fn remember_active_provider_session(
@@ -1518,7 +1538,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     let cmd_start = std::time::Instant::now();
 
-    apply_restore_config_from_command(cmd, state);
+    if let Err(err) = apply_restore_config_from_command(cmd, state) {
+        return error_response(&id, &err);
+    }
 
     if let Some(ref server) = state.stream_server {
         let mut broadcast_cmd;
@@ -9358,7 +9380,7 @@ mod tests {
         state.restore_save_status = "skipped_restore_failed".to_string();
         state.restore_saved_path = Some("/tmp/old-key.json".to_string());
 
-        apply_restore_config_from_command(&json!({ "restoreKey": "new-key" }), &mut state);
+        apply_restore_config_from_command(&json!({ "restoreKey": "new-key" }), &mut state).unwrap();
 
         assert_eq!(state.session_name.as_deref(), Some("new-key"));
         assert_eq!(state.restore_status, "pending");
@@ -9378,7 +9400,8 @@ mod tests {
         state.restore_load_failed = true;
         state.restore_save_status = "skipped_restore_failed".to_string();
 
-        apply_restore_config_from_command(&json!({ "restoreKey": "same-key" }), &mut state);
+        apply_restore_config_from_command(&json!({ "restoreKey": "same-key" }), &mut state)
+            .unwrap();
 
         assert_eq!(state.session_name.as_deref(), Some("same-key"));
         assert_eq!(state.restore_status, "loaded_but_invalid");
@@ -9405,7 +9428,8 @@ mod tests {
                 "restoreCheckFn": null
             }),
             &mut state,
-        );
+        )
+        .unwrap();
 
         assert_eq!(state.restore_save, "auto");
         assert!(state.restore_check_url.is_none());
@@ -9431,12 +9455,43 @@ mod tests {
                 "restoreCheckText": "Dashboard"
             }),
             &mut state,
-        );
+        )
+        .unwrap();
 
         assert_eq!(state.restore_check_text.as_deref(), Some("Dashboard"));
         assert_eq!(state.restore_status, "loaded");
         assert!(!state.restore_load_failed);
         assert!(state.restore_validation_pending);
+    }
+
+    #[test]
+    fn test_restore_config_rejects_invalid_restore_key() {
+        let mut state = DaemonState::new();
+
+        let err = apply_restore_config_from_command(&json!({ "restoreKey": "../bad" }), &mut state)
+            .unwrap_err();
+
+        assert!(err.contains("Invalid session name"));
+        assert!(state.session_name.is_none());
+        assert_eq!(state.restore_status, "not_configured");
+    }
+
+    #[test]
+    fn test_restore_config_rejects_invalid_save_policy() {
+        let mut state = DaemonState::new();
+
+        let err = apply_restore_config_from_command(
+            &json!({
+                "restoreKey": "same-key",
+                "restoreSave": "sometimes"
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Invalid restore save policy"));
+        assert!(state.session_name.is_none());
+        assert_eq!(state.restore_save, "auto");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use super::cdp::types::{
     CreateTargetResult, EvaluateParams,
 };
 use super::cookies::{self, Cookie};
-use crate::validation::sanitize_session_component;
+use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -315,6 +315,9 @@ pub async fn save_state(
             let dir = get_sessions_dir();
             let _ = fs::create_dir_all(&dir);
             let name = session_name.unwrap_or("default");
+            if !is_valid_session_name(name) {
+                return Err(session_name_error(name));
+            }
             dir.join(format!("{}-{}.json", name, session_id_str))
                 .to_string_lossy()
                 .to_string()
@@ -341,6 +344,10 @@ pub async fn save_auto_state_transactional(
     session_id_str: &str,
     visited_origins: &HashSet<String>,
 ) -> Result<String, String> {
+    if !is_valid_session_name(session_name) {
+        return Err(session_name_error(session_name));
+    }
+
     let dir = get_sessions_dir();
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create state directory {}: {}", dir.display(), e))?;
@@ -737,6 +744,10 @@ fn decrypt_data(data: &[u8], key_str: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn find_auto_state_file(session_name: &str) -> Option<String> {
+    if !is_valid_session_name(session_name) {
+        return None;
+    }
+
     let dir = get_sessions_dir();
     if !dir.exists() {
         return None;

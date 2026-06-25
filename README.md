@@ -580,7 +580,7 @@ agent-browser --state ./my-auth.json open https://app.example.com/dashboard
 
 # 4. Or use --restore for automatic persistence
 SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
-agent-browser --session "$SESSION" --restore state load ./my-auth.json
+agent-browser --session "$SESSION" --restore --state ./my-auth.json open https://app.example.com/dashboard
 # From now on, --session "$SESSION" --restore auto-saves/restores this state
 ```
 

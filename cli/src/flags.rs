@@ -605,8 +605,23 @@ pub fn parse_flags(args: &[String]) -> Flags {
     };
 
     let mut i = 0;
+    let mut seen_command = false;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        if !arg.starts_with('-') && looks_like_command(arg) {
+            seen_command = true;
+        }
+        match arg {
+            s if s.starts_with("--restore=") => {
+                flags.cli_restore = true;
+                let value = s.trim_start_matches("--restore=");
+                if value.is_empty() {
+                    flags.restore_uses_session = true;
+                } else {
+                    flags.restore = Some(value.to_string());
+                    flags.restore_uses_session = false;
+                }
+            }
             "--json" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.json = val;
@@ -638,9 +653,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--restore" => {
                 flags.cli_restore = true;
                 let next = args.get(i + 1);
-                if let Some(s) = next {
+                if seen_command {
+                    flags.restore_uses_session = true;
+                } else if let Some(s) = next {
                     if !s.starts_with('-') && !looks_like_command(s) {
                         flags.restore = Some(s.clone());
+                        flags.restore_uses_session = false;
                         i += 1;
                     } else {
                         flags.restore_uses_session = true;
@@ -1037,10 +1055,15 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     ];
 
     let mut i = 0;
+    let mut seen_command = false;
     while i < args.len() {
         let arg = &args[i];
         if skip_next {
             skip_next = false;
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--restore=") {
             i += 1;
             continue;
         }
@@ -1050,9 +1073,11 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             continue;
         }
         if arg == "--restore" {
-            if let Some(v) = args.get(i + 1) {
-                if !v.starts_with('-') && !looks_like_command(v) {
-                    i += 1;
+            if !seen_command {
+                if let Some(v) = args.get(i + 1) {
+                    if !v.starts_with('-') && !looks_like_command(v) {
+                        i += 1;
+                    }
                 }
             }
             i += 1;
@@ -1066,6 +1091,9 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             }
             i += 1;
             continue;
+        }
+        if !arg.starts_with('-') && looks_like_command(arg) {
+            seen_command = true;
         }
         result.push(arg.clone());
         i += 1;
@@ -1197,6 +1225,27 @@ mod tests {
     #[test]
     fn test_parse_restore_with_explicit_key() {
         let input = args("--restore login-state open http://localhost:3000");
+        let flags = parse_flags(&input);
+
+        assert_eq!(flags.restore.as_deref(), Some("login-state"));
+        assert!(!flags.restore_uses_session);
+        assert_eq!(clean_args(&input), vec!["open", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn test_parse_restore_after_command_does_not_consume_url() {
+        let input = args("--session next-loop open --restore http://localhost:3000");
+        let flags = parse_flags(&input);
+
+        assert_eq!(flags.session, "next-loop");
+        assert!(flags.restore_uses_session);
+        assert!(flags.restore.is_none());
+        assert_eq!(clean_args(&input), vec!["open", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn test_parse_restore_equals_with_explicit_key_after_command() {
+        let input = args("open --restore=login-state http://localhost:3000");
         let flags = parse_flags(&input);
 
         assert_eq!(flags.restore.as_deref(), Some("login-state"));
