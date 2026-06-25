@@ -133,6 +133,24 @@ async fn create_restore_state_with_cookie(
     assert_eq!(get_data(&resp)["saveStatus"], "saved");
 }
 
+fn cleanup_restore_state_files(restore_key: &str) {
+    let Some(sessions_dir) = dirs::home_dir().map(|home| home.join(".agent-browser/sessions"))
+    else {
+        return;
+    };
+
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with(&format!("{}-", restore_key)) {
+                let path = entry.path();
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(format!("{}.previous", path.to_string_lossy()));
+            }
+        }
+    }
+}
+
 async fn send_raw_http_request(port: u64, request: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
@@ -3627,6 +3645,58 @@ async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
     (base_url, handle)
 }
 
+/// Starts a tiny cookie-gated app that behaves like a Next dev target with
+/// cookie-backed login state.
+async fn start_cookie_login_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        for _ in 0..100 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or_default();
+                let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                let has_auth_cookie = request.lines().any(|line| {
+                    line.to_ascii_lowercase().starts_with("cookie:")
+                        && line.contains("next_dev_loop_auth=1")
+                });
+
+                let mut headers = vec!["Content-Type: text/html".to_string()];
+                let body = if path.starts_with("/login") {
+                    headers.push(
+                        "Set-Cookie: next_dev_loop_auth=1; Path=/; Max-Age=3600; SameSite=Lax"
+                            .to_string(),
+                    );
+                    "<!doctype html><title>Logged in</title><main>Login complete</main>".to_string()
+                } else if has_auth_cookie {
+                    "<!doctype html><title>Home</title><main>Welcome back</main>".to_string()
+                } else {
+                    "<!doctype html><title>Home</title><main>Please sign in</main>".to_string()
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    headers.join("\r\n"),
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
 /// Starts a tiny HTTP server that serves a delayed-render login form.
 ///
 /// The page continuously fetches `/ping` so `networkidle` is hard to reach,
@@ -5376,6 +5446,143 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.previous", path));
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_restore_preserves_cookie_login_after_close_and_reopen() {
+    let restore_key = format!(
+        "e2e-next-cookie-login-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENCRYPTION_KEY",
+    ]);
+    env.remove("AGENT_BROWSER_SESSION_NAME");
+    env.remove("AGENT_BROWSER_RESTORE_SAVE");
+    env.remove("AGENT_BROWSER_STATE");
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+
+    let (base_url, _server) = start_cookie_login_server().await;
+
+    {
+        let mut state = DaemonState::new();
+
+        let resp = execute_command(
+            &json!({
+                "id": "1",
+                "action": "navigate",
+                "url": base_url.clone(),
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "missing");
+
+        let resp = execute_command(
+            &json!({ "id": "2", "action": "evaluate", "script": "document.body.innerText" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert!(
+            get_data(&resp)["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Please sign in"),
+            "first homepage load should be logged out: {}",
+            resp
+        );
+
+        let resp = execute_command(
+            &json!({
+                "id": "3",
+                "action": "navigate",
+                "url": format!("{}/login", base_url),
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let resp = execute_command(
+            &json!({
+                "id": "4",
+                "action": "navigate",
+                "url": base_url.clone(),
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let resp = execute_command(
+            &json!({ "id": "5", "action": "evaluate", "script": "document.body.innerText" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert!(
+            get_data(&resp)["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Welcome back"),
+            "login route should set cookie for current browser: {}",
+            resp
+        );
+
+        let resp = execute_command(&json!({ "id": "6", "action": "close" }), &mut state).await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["saveStatus"], "saved");
+    }
+
+    let path = super::state::find_auto_state_file(&restore_key)
+        .expect("close should save cookie-backed restore state");
+
+    {
+        let mut state = DaemonState::new();
+        let resp = execute_command(
+            &json!({
+                "id": "10",
+                "action": "navigate",
+                "url": base_url.clone(),
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
+
+        let resp = execute_command(
+            &json!({ "id": "11", "action": "evaluate", "script": "document.body.innerText" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert!(
+            get_data(&resp)["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Welcome back"),
+            "reopened session should keep cookie login on homepage: {}",
+            resp
+        );
+
+        let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+        assert_success(&resp);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.previous", path));
+    cleanup_restore_state_files(&restore_key);
 }
 
 #[tokio::test]
