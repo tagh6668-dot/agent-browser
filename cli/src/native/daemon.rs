@@ -317,9 +317,11 @@ async fn run_socket_server(
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
 
-    // The Windows loop has no CDP drain tick, so give autosave its own tick.
-    let mut autosave_tick = tokio::time::interval(Duration::from_millis(1_000));
-    autosave_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Mirror the unix loop's background tick: reap a browser the user closed
+    // by hand, and drain CDP events (dialog state in particular) before
+    // autosave so a save never runs against a dialog-blocked renderer.
+    let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
+    drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -339,9 +341,19 @@ async fn run_socket_server(
                     }
                 }
             }
-            _ = autosave_tick.tick() => {
+            _ = drain_interval.tick() => {
                 let mut s = state.lock().await;
-                maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                let process_exited = s
+                    .browser
+                    .as_mut()
+                    .map(|mgr| mgr.has_process_exited())
+                    .unwrap_or(false);
+                if process_exited {
+                    let _ = close_current_browser(&mut s).await;
+                } else if s.browser.is_some() {
+                    s.drain_cdp_events_background().await;
+                    maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                }
             }
             _ = async {
                 match idle_sleep_pin {

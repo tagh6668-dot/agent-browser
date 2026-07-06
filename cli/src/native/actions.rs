@@ -276,15 +276,12 @@ pub struct DaemonState {
     pub restore_validation_pending: bool,
     pub restore_save_status: String,
     pub restore_saved_path: Option<String>,
-    /// True when a browser-touching command has run since the last successful
-    /// session save; drives the daemon's periodic autosave tick.
-    pub autosave_pending: bool,
     /// When the most recent browser-touching command finished. Periodic
     /// autosaves wait for a quiet period after this so a multi-second save
     /// never lands in the middle of an active command burst.
     pub last_command_finished: Option<std::time::Instant>,
-    /// When the last periodic autosave was attempted (success or failure),
-    /// used to enforce the minimum interval between attempts.
+    /// When session state was last saved or a periodic autosave last failed,
+    /// used to enforce the minimum interval between periodic saves.
     pub last_autosave_attempt: Option<std::time::Instant>,
     pub session_id: String,
     pub tracing_state: TracingState,
@@ -378,7 +375,6 @@ impl DaemonState {
             restore_validation_pending: false,
             restore_save_status: "not_attempted".to_string(),
             restore_saved_path: None,
-            autosave_pending: false,
             last_command_finished: None,
             last_autosave_attempt: None,
             session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
@@ -1996,12 +1992,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         validate_restore_if_pending(state).await;
     }
 
-    // Any command that touches the browser may have changed cookies or
-    // storage (page JS can mutate them even during "read" interactions), so
-    // treat it as making the session eligible for the next periodic autosave.
-    // Marked even on error: a failed click can still have navigated.
+    // Stamp browser-touching commands so periodic autosave waits for an
+    // active command burst to settle before collecting state. Stamped even on
+    // error: a failed click can still have navigated.
     if !skip_launch {
-        state.autosave_pending = true;
         state.last_command_finished = Some(std::time::Instant::now());
     }
 
@@ -2536,10 +2530,10 @@ const AUTOSAVE_QUIET_PERIOD_MS: u64 = 2_000;
 
 /// Whether the daemon's periodic tick should attempt an autosave right now.
 ///
-/// Cheap pre-checks only; the full policy matrix (restore key, save policy,
-/// restore-failed skip) lives in `auto_save_restore_state`, which this gates.
+/// Timing and dialog pre-checks only; restore-key, save-policy, and browser
+/// gating live in `maybe_autosave_restore_state` and `auto_save_restore_state`.
 fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
-    if interval_ms == 0 || !state.autosave_pending {
+    if interval_ms == 0 {
         return false;
     }
     // A JS dialog blocks the renderer's main thread, so the storage-collection
@@ -2561,25 +2555,25 @@ fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
     true
 }
 
-/// Periodically persist session state while the browser is alive, so a
-/// browser the user closes by hand (which kills CDP and makes save-on-close
-/// impossible) loses at most `interval_ms` of state.
+/// Periodically persist session state while a browser is open with a restore
+/// key configured, so a browser the user closes by hand (which kills CDP and
+/// makes save-on-close impossible) loses at most roughly `interval_ms` of
+/// state. Saves stay eligible even without new commands: the page itself can
+/// mutate cookies and storage while idle (token refreshes, background
+/// requests), so idle sessions are re-saved on every interval too.
 ///
 /// Called from the daemon's background tick. Failures are expected while a
-/// page is mid-navigation; the pending flag stays set so the next interval
-/// retries, and `auto_save_restore_state` records the status either way.
+/// page is mid-navigation; the next interval retries, and
+/// `auto_save_restore_state` records the status either way.
 pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interval_ms: u64) {
     if !autosave_due(state, interval_ms) {
         return;
     }
-    // Sessions without a restore key, or with saving disabled, can never
-    // autosave; clear the flag so the tick stays a no-op for them.
+    // Sessions without a restore key, or with saving disabled, never autosave.
     if state.session_name.is_none() || state.restore_save == "never" {
-        state.autosave_pending = false;
         return;
     }
-    // No browser means nothing to collect from; keep the flag so a save can
-    // still happen if a relaunch path picks the session back up.
+    // No browser means nothing to collect from.
     if state.browser.is_none() {
         return;
     }
@@ -2639,7 +2633,9 @@ pub(crate) async fn auto_save_restore_state(
         Ok(path) => {
             state.restore_save_status = "saved".to_string();
             state.restore_saved_path = Some(path.clone());
-            state.autosave_pending = false;
+            // Saves from any path (close, relaunch, restore-key change) reset
+            // the periodic interval so the tick doesn't immediately re-save.
+            state.last_autosave_attempt = Some(std::time::Instant::now());
             Ok(Some(path))
         }
         Err(err) => {
@@ -9543,19 +9539,18 @@ mod tests {
     }
 
     #[test]
-    fn test_autosave_due_requires_pending_flag_and_interval() {
-        let mut state = DaemonState::new();
-        assert!(!autosave_due(&state, 30_000), "clean session is never due");
-
-        state.autosave_pending = true;
-        assert!(autosave_due(&state, 30_000));
+    fn test_autosave_due_requires_interval() {
+        let state = DaemonState::new();
+        assert!(
+            autosave_due(&state, 30_000),
+            "idle sessions stay eligible so page-driven mutations get saved"
+        );
         assert!(!autosave_due(&state, 0), "interval 0 disables autosave");
     }
 
     #[test]
     fn test_autosave_waits_for_quiet_period_after_command() {
         let mut state = DaemonState::new();
-        state.autosave_pending = true;
 
         state.last_command_finished = Some(std::time::Instant::now());
         assert!(!autosave_due(&state, 30_000));
@@ -9570,7 +9565,6 @@ mod tests {
     #[test]
     fn test_autosave_enforces_min_interval_between_attempts() {
         let mut state = DaemonState::new();
-        state.autosave_pending = true;
 
         state.last_autosave_attempt = Some(std::time::Instant::now());
         assert!(!autosave_due(&state, 30_000));
@@ -9584,7 +9578,6 @@ mod tests {
     #[test]
     fn test_autosave_blocked_while_dialog_open() {
         let mut state = DaemonState::new();
-        state.autosave_pending = true;
         state.pending_dialog = Some(PendingDialog {
             dialog_type: "confirm".to_string(),
             message: "Are you sure?".to_string(),
@@ -9596,13 +9589,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_autosave_clears_pending_when_it_can_never_apply() {
-        // No restore key: the flag is dropped so the tick stays a no-op.
+    async fn test_autosave_skips_sessions_it_can_never_apply_to() {
+        // No restore key: the tick is a no-op.
         let mut state = DaemonState::new();
         state.session_name = None;
-        state.autosave_pending = true;
         maybe_autosave_restore_state(&mut state, 30_000).await;
-        assert!(!state.autosave_pending);
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
 
@@ -9610,24 +9601,17 @@ mod tests {
         let mut state = DaemonState::new();
         state.session_name = Some("my-session".to_string());
         state.restore_save = "never".to_string();
-        state.autosave_pending = true;
         maybe_autosave_restore_state(&mut state, 30_000).await;
-        assert!(!state.autosave_pending);
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
     }
 
     #[tokio::test]
-    async fn test_autosave_keeps_pending_without_browser() {
+    async fn test_autosave_skips_without_browser() {
         let mut state = DaemonState::new();
         state.session_name = Some("my-session".to_string());
         state.restore_save = "auto".to_string();
-        state.autosave_pending = true;
         maybe_autosave_restore_state(&mut state, 30_000).await;
-        assert!(
-            state.autosave_pending,
-            "flag survives until a browser exists to save from"
-        );
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
     }

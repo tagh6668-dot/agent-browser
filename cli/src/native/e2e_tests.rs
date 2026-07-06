@@ -5507,11 +5507,6 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         .await;
         assert_success(&resp);
 
-        assert!(
-            state.autosave_pending,
-            "browser-touching commands should mark the session dirty"
-        );
-
         // The command just finished, so the quiet period must block the tick.
         maybe_autosave_restore_state(&mut state, 30_000).await;
         assert_eq!(state.restore_save_status, "not_attempted");
@@ -5525,10 +5520,24 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
         maybe_autosave_restore_state(&mut state, 30_000).await;
         assert_eq!(state.restore_save_status, "saved");
-        assert!(!state.autosave_pending);
+        assert!(
+            state.last_autosave_attempt.is_some(),
+            "successful save should reset the periodic interval"
+        );
         assert!(
             super::state::find_auto_state_file(&restore_key).is_some(),
             "periodic autosave should write the session state file"
+        );
+
+        // An idle session stays eligible: once the interval elapses again the
+        // tick re-saves, capturing page-driven mutations like token refreshes.
+        state.last_autosave_attempt =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(31));
+        state.restore_save_status = "not_attempted".to_string();
+        maybe_autosave_restore_state(&mut state, 30_000).await;
+        assert_eq!(
+            state.restore_save_status, "saved",
+            "idle session should be re-saved on the next interval without new commands"
         );
 
         // Kill the browser out from under the daemon, the way a user closing
