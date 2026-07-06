@@ -259,6 +259,7 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_NAMESPACE</code></td><td>Namespace for daemon sockets and restore-state directories.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE</code></td><td>Auto-save/load state persistence key.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_SAVE</code></td><td>Restore save policy: <code>auto</code>, <code>always</code>, or <code>never</code>.</td><td><code>auto</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_AUTOSAVE_INTERVAL_MS</code></td><td>Minimum ms between periodic session autosaves while the browser is open. <code>0</code> saves only on close.</td><td><code>30000</code></td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_URL</code></td><td>URL pattern restored state must match.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_TEXT</code></td><td>Page text restored state must contain.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_FN</code></td><td>JavaScript expression restored state must satisfy.</td><td>(none)</td></tr>

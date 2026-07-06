@@ -14,7 +14,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::test_utils::EnvGuard;
 
-use super::actions::{execute_command, DaemonState};
+use super::actions::{
+    close_current_browser, execute_command, maybe_autosave_restore_state, DaemonState,
+};
 
 fn assert_success(resp: &Value) {
     assert_eq!(
@@ -5434,6 +5436,159 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
         assert!(
             found,
             "Cookie should be restored by explicit launch before first navigation. Cookies found: {:?}",
+            cookies
+                .iter()
+                .map(|c| c["name"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+
+        let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+        assert_success(&resp);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.previous", path));
+}
+
+/// Verify that periodic autosave persists session state while the browser is
+/// open, so state survives the browser dying WITHOUT the daemon's
+/// save-on-close path running (e.g. the user closes the window by hand).
+#[tokio::test]
+#[ignore]
+async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
+    let restore_key = format!(
+        "e2e-autosave-abrupt-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENCRYPTION_KEY",
+    ]);
+    env.remove("AGENT_BROWSER_SESSION_NAME");
+    env.remove("AGENT_BROWSER_RESTORE_SAVE");
+    env.remove("AGENT_BROWSER_STATE");
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+
+    {
+        let mut state = DaemonState::new();
+        let resp = execute_command(
+            &json!({
+                "id": "1",
+                "action": "launch",
+                "headless": true,
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let resp = execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let resp = execute_command(
+            &json!({
+                "id": "3",
+                "action": "cookies_set",
+                "name": "autosave_test",
+                "value": "saved_by_tick",
+                "domain": ".example.com",
+                "path": "/",
+                "expires": 2000000000
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        assert!(
+            state.autosave_pending,
+            "browser-touching commands should mark the session dirty"
+        );
+
+        // The command just finished, so the quiet period must block the tick.
+        maybe_autosave_restore_state(&mut state, 30_000).await;
+        assert_eq!(state.restore_save_status, "not_attempted");
+        assert!(
+            super::state::find_auto_state_file(&restore_key).is_none(),
+            "autosave must not fire inside the post-command quiet period"
+        );
+
+        // Simulate the quiet period having elapsed, then run the tick again.
+        state.last_command_finished =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        maybe_autosave_restore_state(&mut state, 30_000).await;
+        assert_eq!(state.restore_save_status, "saved");
+        assert!(!state.autosave_pending);
+        assert!(
+            super::state::find_auto_state_file(&restore_key).is_some(),
+            "periodic autosave should write the session state file"
+        );
+
+        // Kill the browser out from under the daemon, the way a user closing
+        // the window does: the process exits and CDP dies, so no further save
+        // is possible. Then mimic the daemon drain tick, which only closes.
+        let mgr = state.browser.as_mut().expect("browser should be running");
+        let _ = mgr
+            .client
+            .send_command_no_params("Browser.close", None)
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !mgr.has_process_exited() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            state
+                .browser
+                .as_mut()
+                .expect("browser manager should still be present")
+                .has_process_exited(),
+            "browser process should have exited after Browser.close"
+        );
+        let _ = close_current_browser(&mut state).await;
+    }
+
+    let path = super::state::find_auto_state_file(&restore_key)
+        .expect("autosaved state should survive the abrupt browser exit");
+
+    {
+        let mut state = DaemonState::new();
+        let resp = execute_command(
+            &json!({
+                "id": "10",
+                "action": "launch",
+                "headless": true,
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
+
+        let resp = execute_command(
+            &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let resp =
+            execute_command(&json!({ "id": "12", "action": "cookies_get" }), &mut state).await;
+        assert_success(&resp);
+        let cookies = get_data(&resp)["cookies"].as_array().unwrap();
+        let found = cookies
+            .iter()
+            .any(|c| c["name"] == "autosave_test" && c["value"] == "saved_by_tick");
+        assert!(
+            found,
+            "Cookie saved only by periodic autosave should be restored after the browser was killed without a graceful close. Cookies found: {:?}",
             cookies
                 .iter()
                 .map(|c| c["name"].as_str().unwrap_or("?"))

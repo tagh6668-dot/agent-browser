@@ -3570,6 +3570,7 @@ Environment:
   AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state
   AGENT_BROWSER_RESTORE          Auto-save/restore persistence key
   AGENT_BROWSER_RESTORE_SAVE     Restore save policy: auto, always, never
+  AGENT_BROWSER_AUTOSAVE_INTERVAL_MS Min ms between periodic session autosaves (default: 30000, 0 disables)
   AGENT_BROWSER_RESTORE_CHECK_URL URL pattern restored state must match
   AGENT_BROWSER_RESTORE_CHECK_TEXT Page text restored state must contain
   AGENT_BROWSER_RESTORE_CHECK_FN JS expression restored state must satisfy
