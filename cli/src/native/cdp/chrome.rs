@@ -1792,6 +1792,8 @@ mod tests {
                 temp_user_data_dir: Some(dir.clone()),
                 #[cfg(unix)]
                 pgid: None,
+                #[cfg(target_os = "linux")]
+                xvfb: None,
             };
             // _process dropped here
         }
