@@ -88,6 +88,13 @@ fn validate_lightpanda_options(options: &LaunchOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// Liveness-probe timeout: a live renderer answers in ms; a discarded tab
+/// never answers, which is the only discard signal CDP exposes (#1528).
+const RENDERER_PROBE_TIMEOUT_MS: u64 = 3_000;
+
+/// How long a revived renderer gets to answer after Page.reload.
+const REVIVED_RENDERER_TIMEOUT_MS: u64 = 10_000;
+
 /// Returns true for Chrome internal targets that should not be selected
 /// during auto-connect (e.g. chrome://, chrome-extension://, devtools://).
 fn is_internal_chrome_target(url: &str) -> bool {
@@ -624,6 +631,54 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Whether the tab's renderer answers a renderer-bound command within
+    /// `timeout_ms`. A discarded tab keeps its CDP session but has no
+    /// renderer to reply (#1528). A CDP error still counts as responding.
+    async fn renderer_responds(&self, session_id: &str, timeout_ms: u64) -> bool {
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            self.client.send_command(
+                "Runtime.evaluate",
+                Some(json!({ "expression": "1", "returnByValue": true })),
+                Some(session_id),
+            ),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Ensure the tab has a live renderer, reviving a discarded one with
+    /// Page.reload (the browser process answers it even when the renderer is
+    /// dead, and respawns it without stealing focus).
+    async fn ensure_renderer_alive(&self, session_id: &str) -> Result<(), String> {
+        if self
+            .renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
+            .await
+        {
+            return Ok(());
+        }
+        self.client
+            .send_command_no_params("Page.reload", Some(session_id))
+            .await
+            .map_err(|e| {
+                format!(
+                    "tab is not responding (discarded or crashed) and Page.reload failed: {}",
+                    e
+                )
+            })?;
+        if self
+            .renderer_responds(session_id, REVIVED_RENDERER_TIMEOUT_MS)
+            .await
+        {
+            Ok(())
+        } else {
+            Err(
+                "tab is not responding (discarded or crashed) and did not recover after reload"
+                    .to_string(),
+            )
+        }
+    }
+
     /// Enable domains on a direct page connection (no session_id needed).
     async fn enable_domains_direct(&self) -> Result<(), String> {
         self.client
@@ -1085,9 +1140,19 @@ impl BrowserManager {
             ));
         }
 
-        self.active_page_index = index;
         let session_id = self.pages[index].session_id.clone();
+        // A discarded background tab has no renderer to answer Page.enable,
+        // so the switch used to hang and leave active_page_index on the dead
+        // tab. Revive first; commit the switch only once it's usable (#1528).
+        self.ensure_renderer_alive(&session_id).await.map_err(|e| {
+            format!(
+                "Cannot switch to tab {}: {}",
+                format_tab_id(self.pages[index].tab_id),
+                e
+            )
+        })?;
         self.enable_domains(&session_id).await?;
+        self.active_page_index = index;
 
         // Bring tab to front
         let _ = self
@@ -2198,5 +2263,139 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Timeout waiting for networkidle"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Discarded-tab revival tests (#1528)
+    // -----------------------------------------------------------------------
+
+    /// Mock CDP endpoint with two page targets; the second mimics a
+    /// Memory-Saver-discarded tab: its session exists but renderer-bound
+    /// commands get no response until Page.reload revives it (when `revivable`).
+    async fn start_mock_cdp_browser_with_discarded_tab(revivable: bool) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            let mut revived = false;
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let session = cmd["sessionId"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                let reply = match method {
+                    "Target.setDiscoverTargets" | "Target.setAutoAttach" => {
+                        Some(respond(json!({})))
+                    }
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            {
+                                "targetId": "T-ALIVE",
+                                "type": "page",
+                                "title": "alive",
+                                "url": "https://alive.test/",
+                                "attached": false,
+                            },
+                            {
+                                "targetId": "T-DISCARDED",
+                                "type": "page",
+                                "title": "discarded",
+                                "url": "https://discarded.test/",
+                                "attached": false,
+                            },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{}", target) })))
+                    }
+                    // The browser process answers Page.reload even when the
+                    // renderer is gone, and the reload respawns it.
+                    "Page.reload" => {
+                        if session == "S-T-DISCARDED" && revivable {
+                            revived = true;
+                        }
+                        Some(respond(json!({})))
+                    }
+                    // Renderer-bound commands on the discarded session never
+                    // get any response until the tab is revived.
+                    _ if session == "S-T-DISCARDED" && !revived => None,
+                    "Runtime.evaluate" => Some(respond(
+                        json!({ "result": { "type": "string", "value": "https://discarded.test/" } }),
+                    )),
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        url
+    }
+
+    /// Regression test for #1528: switching to a discarded tab must revive
+    /// it via Page.reload instead of hanging until the CDP command timeout
+    /// (and wedging the daemon behind the held state lock).
+    #[tokio::test]
+    async fn test_tab_switch_revives_discarded_tab() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert_eq!(mgr.pages.len(), 2);
+        assert_eq!(mgr.active_page_index, 0);
+
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1))
+            .await
+            .expect("tab_switch must not hang on a discarded tab")
+            .expect("switching to a discarded tab should revive it");
+
+        assert_eq!(result["tabId"], json!("t2"));
+        assert_eq!(mgr.active_page_index, 1);
+    }
+
+    /// Regression test for #1528: when the dead tab cannot be revived, the
+    /// switch must fail fast with a clear error and must NOT leave
+    /// active_page_index pointing at the dead tab, which would wedge every
+    /// subsequent command (and the periodic autosave) against it.
+    #[tokio::test]
+    async fn test_tab_switch_to_dead_tab_fails_without_poisoning_active_tab() {
+        let url = start_mock_cdp_browser_with_discarded_tab(false).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1))
+            .await
+            .expect("tab_switch must not hang on a dead tab")
+            .expect_err("switching to an unrevivable tab should fail");
+
+        assert!(err.contains("not responding"), "unexpected error: {}", err);
+        assert_eq!(
+            mgr.active_page_index, 0,
+            "a failed switch must not leave the active tab pointing at a dead renderer"
+        );
     }
 }
