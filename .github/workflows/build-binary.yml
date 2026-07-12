@@ -1,0 +1,13 @@
+name: Build Binary
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cd cli && cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-browser-bin
+          path: cli/target/release/agent-browser
